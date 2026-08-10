@@ -5,6 +5,8 @@ extern void run_sensor_tests(void);
 extern void run_motor_tests(void);
 extern void run_state_tests(void);
 extern void run_storage_tests(void);
+extern void run_balloon_physics_tests(void);
+extern void run_volume_estimator_tests(void);
 
 static const char *TAG = "BIP_UNITY_RUNNER";
 
@@ -17,6 +19,9 @@ extern "C" void app_main(void) {
     run_motor_tests();
     run_state_tests();
     run_storage_tests();
+    run_balloon_physics_tests();
+    run_volume_estimator_tests();
     
     UNITY_END();
 }
+
