@@ -51,8 +51,8 @@
 #define TELEM_BUFFER_SIZE   10
 #define TELEM_RING_BUF_SIZE (32 * 1024) // 32 KB Lock-Free RingBuffer
 
-// Full-Precision Pop Black Box RAM Buffer (2000 Samples @ 2000 SPS = 1.0 Sec Full Precision)
-#define POP_BUF_SIZE        2000
+// Full-Precision Pop Black Box RAM Buffer (4000 Samples @ 2000 SPS = 2.0 Sec Full Precision: 1.5s Pre-Pop + 0.5s Post-Pop)
+#define POP_BUF_SIZE        4000
 
 // Task Priorities & Cores
 #define CONTROL_TASK_PRIO   12 // Real-time priority
