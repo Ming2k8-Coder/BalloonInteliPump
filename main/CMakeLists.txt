@@ -4,6 +4,7 @@ idf_component_register(
          "bip_motor.cpp"
          "bip_storage.cpp"
          "bip_state.cpp"
+         "bip_diagnostics.cpp"
     INCLUDE_DIRS "."
     REQUIRES driver nvs_flash esp_wifi lwip esp_timer esp_adc log
 )

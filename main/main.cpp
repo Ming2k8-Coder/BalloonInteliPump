@@ -20,6 +20,7 @@
 #include "bip_motor.h"
 #include "bip_storage.h"
 #include "bip_state.h"
+#include "bip_diagnostics.h"
 
 static const char *TAG = "BIP_MAIN";
 
@@ -249,6 +250,8 @@ static void execute_command(const char* cmd) {
         printf("PRESSURE_ZEROED\n");
     } else if (strcmp(cmd, "GET_POP_DUMP") == 0 || strcmp(cmd, "DUMP_POP") == 0) {
         dump_pop_recording();
+    } else if (strcmp(cmd, "RUN_SELF_TEST") == 0 || strcmp(cmd, "SELF_TEST") == 0) {
+        print_diagnostic_report();
     } else if (strcmp(cmd, "GET_DIAGNOSTICS") == 0 || strcmp(cmd, "STATUS") == 0) {
         printf("DIAG,uptime=%lld,heap=%lu,mcu_temp=%.1f,mode=%d,samples=%lu,pop_recorded=%d\n",
                esp_timer_get_time() / 1000000, esp_get_free_heap_size(), read_mcu_temp(),

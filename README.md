@@ -4,9 +4,9 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Dual--Core%20Lock--Free%20RingBuffer-orange.svg)]()
 
-**Balloon Intelligent Pump (BIP)** is an industrial-grade, high-precision automated telemetry and measurement framework designed to analyze the mechanical and viscoelastic properties of latex balloons and inflatable elastomeric materials.
+**Balloon Intelligent Pump (BIP)** is an industrial-grade, high-precision automated telemetry and measurement framework designed to analyze the mechanical, viscoelastic, and recreational inflation properties of latex balloons and inflatable elastomeric materials.
 
-Featuring **smart material yield detection**, **controlled destruction burst testing**, **Recursive Least Squares (RLS) time-series forecasting**, and **real-time lock-free UDP telemetry**, BIP bridges the gap between basic pneumatic inflation and scientific material characterization.
+Featuring **smart material yield detection**, **controlled destruction burst testing**, **dynamic breathing heartbeat pulses**, **rhythmic waveform generation**, **4000-sample Pop Black Box RAM recording**, **Recursive Least Squares (RLS) time-series forecasting**, and **real-time lock-free UDP telemetry**, BIP bridges the gap between pneumatic inflation hardware and scientific material characterization.
 
 ---
 
@@ -27,8 +27,9 @@ graph TD
 
     subgraph ESP32["ESP32 Dual-Core Native ESP-IDF Firmware"]
         subgraph Core1["Core 1: Real-Time Control Task (Prio 12)"]
-            DRDY["ADS1220 2000 SPS DRDY Interrupt"] -->|vTaskNotifyGiveFromISR| Control["Control Loop & PID Engine"]
-            ADC["Oneshot ADC (Volts / Amps)"] --> Control
+            DRDY["ADS1220 2000 SPS DRDY Interrupt"] -->|vTaskNotifyGiveFromISR| Control["Control Loop & DSP Engine"]
+            Kalman["1D Adaptive Kalman Filter"] --> Control
+            SG["Savitzky-Golay FIR dP/dt Filter"] --> Control
             Control --> PWM["25 kHz Ultrasonic Motor LEDC PWM"]
             Control --> Valve["20 kHz Solenoid Relief Valve"]
         end
@@ -45,6 +46,9 @@ graph TD
         RingBuf[("32 KB Lock-Free<br/>FreeRTOS RingBuffer")]
         Control -->|Zero-Copy Push| RingBuf
         RingBuf -->|Batch Read| Sockets
+
+        PopRAM[("4000-Sample Safe RAM<br/>18µs Fast memcpy Buffer")]
+        Control -->|Pop Trigger| PopRAM
     end
 
     Sockets <-->|"UDP Broadcast Telemetry"| Server
@@ -55,58 +59,43 @@ graph TD
     classDef pc fill:#0f172a,stroke:#6366f1,stroke-width:2px,color:#f8fafc;
     classDef ring fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
 
-    class Core1,Control,DRDY,ADC,PWM,Valve core1;
+    class Core1,Control,DRDY,Kalman,SG,PWM,Valve core1;
     class Core0,WiFi,Sockets,UART,Temp core0;
     class PC,Server,ML,Classifier,GUI pc;
-    class RingBuf ring;
+    class RingBuf,PopRAM ring;
 ```
 
 ---
 
-## 🌟 Key Technical Features
+## ⚡ Key Technical Features
 
-### ⚡ Native ESP-IDF & FreeRTOS Dual-Core Architecture
-- **Hardware Interrupt Synchronization:** ADS1220 24-bit ADC `DRDY` GPIO interrupt triggers direct task notification (`vTaskNotifyGiveFromISR`) unblocking Core 1's `control_task` at **2000 SPS with microsecond precision** and zero polling jitter.
-- **32 KB Lock-Free RingBuffer:** Uses native ESP-IDF `ringbuf.h` for zero-copy data passing between Core 1 (Control/DSP) and Core 0 (Network Sockets).
-- **25 kHz Ultrasonic Hardware PWM:** Motors and solenoid valves run on ESP-IDF LEDC hardware timers at **25 kHz / 20 kHz**, eliminating human-audible motor whine and reducing MOSFET switching heat.
-- **Internal Silicon Junction Thermal Telemetry:** Monitors MCU junction temperature (`driver/temperature_sensor.h`) to detect thermal stress under heavy motor loads.
-
-### 🧠 Time-Series ML & Material Analytics
-- **Recursive Least Squares (RLS) Predictive Engine:** Dynamically models viscoelastic balloon expansion curves and forecasts pressure 150ms ahead.
-- **Predictive Burst Safety Cutoff:** Automatically halts pump output if forecasted pressure exceeds 95% of estimated material burst limits.
-- **Smart Yield Detection:** Monitors sliding window pressure gradients ($dP/dt$), detecting first material yield points and inflating to configurable multiples (e.g., $1.20 \times \text{Yield}$).
-- **Cubic Fatigue Index:** Tracks material stress-strain work accumulation ($\text{Stress}^3 \cdot dt$) to display real-time balloon health degradation and remaining elastic reserve percentage.
-
-### 🧪 Bare-MCU Unity Unit Testing Suite
-- **Hardware-Free Testing:** Runs Unity unit tests (`#include "unity.h"`) directly on a bare ESP32 board over standard USB-UART without requiring physical pumps, valves, or external ADCs.
-- **Automated Validation:** Tests PID loop stability, soft-start PWM ramping, 3-sample inrush overcurrent filters, undervoltage lockouts, and NVS serialization.
+- **Microsecond Hardware DRDY Interrupt:** Synced to 2000 SPS ADS1220 24-bit SPI ADC using FreeRTOS Direct Task Notifications (`vTaskNotifyGiveFromISR`).
+- **1D Adaptive Kalman Filter:** Zero-phase-lag digital filtering for high-precision pressure readings.
+- **Savitzky-Golay 9-Point FIR Derivative Filter:** Computes 1st ($dP/dt$) and 2nd ($d^2P/dt^2$) analytical derivatives for inflection yield detection.
+- **4000-Sample Pop Black Box RAM Buffer:** 2.0-second full precision recording (1.5s pre-pop yield + 0.5s post-pop collapse) with <18µs fast `memcpy()` to safe RAM.
+- **Dynamic Breathing Heartbeat Mode (`MODE_PULSE`):** Rhythmic $0.1\text{--}2.0\text{ Hz}$ sine pulse generator for living balloon feel with automatic safety relief venting.
+- **Rhythmic Waveform Pattern Player (`MODE_PATTERN`):** Plays Sine, Stairs, Triangle, and Crescendo pressure cycles.
+- **32 KB Lock-Free RingBuffer:** Inter-core zero-copy stream from Core 1 DSP to Core 0 LwIP BSD UDP sockets.
+- **Automated Hardware Self-Test Engine:** `RUN_SELF_TEST` diagnostic verification of SPI ADC, MCU thermal sensor, and PWM drivers.
 
 ---
 
-## 🌿 Git Branching Strategy
-
-| Branch | Platform / Architecture | Key Characteristics |
-| :--- | :--- | :--- |
-| **`espidf`** *(Current Default)* | **Native ESP-IDF v5.x / C++** | FreeRTOS Dual-Core Tasks, 32KB RingBuffer, 25kHz LEDC PWM, NVS storage, Unity Unit Test suite. |
-| **`arduino`** | **Arduino Framework / C++** | Standard `.ino` sketch compatibility for Arduino Nano / Uno / simple setups. |
-
----
-
-## 📂 Directory Layout
+## 📂 Repository Layout
 
 ```text
 BalloonInteliPump/
-├── CMakeLists.txt              <-- Root ESP-IDF CMake build script
+├── CMakeLists.txt              <-- Top-level ESP-IDF build manifest
 ├── sdkconfig.defaults          <-- ESP-IDF defaults (240MHz CPU, FreeRTOS 1000Hz, WDT)
 ├── .gitignore                  <-- Git build exclusion rules
 ├── components/                 <-- ESP-IDF custom component folder
 ├── main/                       <-- ESP-IDF Core Component (app_main)
-│   ├── CMakeLists.txt          <-- Main component register
-│   ├── bip_config.h            <-- Pinout assignments, PWM frequencies, protocol structs
-│   ├── bip_sensors.h / .cpp    <-- SPI ADS1220 driver, ADC oneshot driver & Tare baseline
+│   ├── CMakeLists.txt          <-- Component manifest
+│   ├── bip_config.h            <-- Pinout, PWM freqs, 4000-sample RAM buffer size
+│   ├── bip_sensors.h / .cpp    <-- SPI ADS1220 driver, Adaptive Kalman Filter & Tare baseline
 │   ├── bip_motor.h / .cpp      <-- 25 kHz LEDC hardware PWM driver & safety limits
 │   ├── bip_storage.h / .cpp    <-- NVS storage manager
-│   ├── bip_state.h / .cpp      <-- PID controller & state machine
+│   ├── bip_state.h / .cpp      <-- FreeRTOS Event Group state machine & waveform generators
+│   ├── bip_diagnostics.h/.cpp  <-- Automated hardware self-test engine
 │   └── main.cpp                <-- FreeRTOS dual-core task runner (app_main)
 ├── test/                       <-- ESP-IDF Unity Unit Test Component
 │   ├── CMakeLists.txt
@@ -133,9 +122,6 @@ BalloonInteliPump/
 
 ### 1. Build and Flash Firmware (ESP-IDF)
 ```bash
-# Ensure you are on the espidf branch
-git checkout espidf
-
 # Build the firmware binary
 idf.py build
 
@@ -147,18 +133,6 @@ idf.py -p COM3 flash monitor
 ```bash
 # Flash and run Unity tests over standard USB-UART (No external hardware needed)
 idf.py -p COM3 test monitor
-```
-
-### 3. Launch Python Dashboard & Telemetry Backend
-```bash
-# Activate virtual environment
-source .venv/bin/activate  # Or .venv\Scripts\Activate.ps1 on Windows
-
-# Launch HTTP Web Server & RLS Predictor
-python server/app.py
-
-# Launch Desktop Dashboard App
-python gui/app.py
 ```
 
 ---
@@ -173,6 +147,10 @@ Commands are sent via line-terminated string payloads over USB Serial or UDP soc
 | `START_MANUAL` | Switches to Manual control mode. |
 | `START_SMART` | Launches automated Yield Point detection inflation. |
 | `START_BURST` | Drives pump at 100% capacity until sample destruction. |
+| `START_PULSE` | Activates Dynamic Breathing Heartbeat mode. |
+| `SET_PULSE <base> <amp> <freq>` | Configures pulse base pressure (kPa), amplitude, and frequency (Hz). |
+| `START_PATTERN` | Activates Rhythmic Waveform Generator. |
+| `SET_PATTERN <pat> <min> <max> <period>` | Configures pattern type (`0: Sine, 1: Stairs, 2: Triangle, 3: Crescendo`). |
 | `STOP` | Emergency Stop. Kills PWM outputs and clears active runs. |
 | `SET_PWM <0-255>` | Sets direct pump PWM level. |
 | `SET_TARGET <kPa>` | Sets manual target pressure for PID closed-loop hold. |
@@ -180,6 +158,8 @@ Commands are sent via line-terminated string payloads over USB Serial or UDP soc
 | `VALVE_ON` / `VALVE_OFF` | Fully opens (100%) or seals (0%) solenoid relief valve. |
 | `SET_VALVE_PWM <0-255>`| Sets solenoid valve duty cycle for proportional relief. |
 | `ZERO_PRESSURE` / `ZERO_TARE` | Zeroes pressure sensor baseline offset on-the-fly. |
+| `GET_POP_DUMP` | Dumps 4000 full-precision samples (2.0s window @ 2000 SPS) from Safe RAM. |
+| `RUN_SELF_TEST` | Runs 5-step automated hardware self-diagnostic test. |
 | `GET_DIAGNOSTICS` | Returns uptime, free heap, MCU junction temp, and sample counts. |
 | `CAL_SAVE` | Commits sensor calibration points to ESP32 NVS flash storage. |
 
@@ -194,7 +174,7 @@ $BIP,Timestamp(ms),Pressure(kPa),PWM,Voltage(V),Current(A),ModeCode,RawP,RawV,Ra
 ```
 
 - **Checksum**: Hexadecimal XOR checksum of all characters between `$` and `*`.
-- **Mode Codes**: `0: IDLE`, `1: MANUAL`, `2: SMART`, `3: BURST`, `4: CALIB`, `5: ERROR`.
+- **Mode Codes**: `0: IDLE`, `1: MANUAL`, `2: SMART`, `3: BURST`, `4: PULSE`, `5: PATTERN`, `6: CALIB`, `7: ERROR`.
 
 ---
 
