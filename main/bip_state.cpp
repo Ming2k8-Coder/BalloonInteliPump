@@ -30,6 +30,17 @@ static int manualPWM = 0;
 static bool manualTargetMode = false;
 static float manualTargetPressure = 20.0f;
 
+// Pulse / Breathing Mode Variables
+static float pulseBasePressure = 15.0f;
+static float pulseAmplitude = 3.0f;
+static float pulseFreqHz = 0.5f; // 0.5 Hz heartbeat pulse
+
+// Pattern Mode Variables
+static WaveformPattern currentPattern = PATTERN_SINE;
+static float patternMinP = 10.0f;
+static float patternMaxP = 25.0f;
+static float patternPeriodSec = 10.0f;
+
 // Advanced PID Controller with Feedforward
 static float pid_Kp = 25.0f;
 static float pid_Ki = 1.2f;
@@ -53,9 +64,7 @@ static float current_d2p_dt2 = 0.0f;
 static float rls_weights[3] = { 0.8f, 0.15f, 0.05f };
 static float last_forecasted = 0.0f;
 
-// ----------------------------------------------------------------------
 // DUAL-RAM SYSTEM: LIVE CONTINUOUS RING BUFFER + FAST MEMCPY SAFE POP RAM
-// ----------------------------------------------------------------------
 static PopBlackBoxSample liveRingBuffer[POP_BUF_SIZE];
 static PopBlackBoxSample safePopRAMBuffer[POP_BUF_SIZE];
 
@@ -79,23 +88,33 @@ static void reset_buffers() {
     pid_lastTime = 0;
 }
 
-// ----------------------------------------------------
-// FREERTOS THREAD-SAFE MODE TRANSITION ENGINE
-// ----------------------------------------------------
+void set_pulse_params(float base_pressure, float amplitude, float frequency_hz) {
+    pulseBasePressure = std::clamp(base_pressure, 1.0f, 60.0f);
+    pulseAmplitude = std::clamp(amplitude, 0.1f, 15.0f);
+    pulseFreqHz = std::clamp(frequency_hz, 0.05f, 5.0f);
+}
+
+void set_pattern(WaveformPattern pattern, float min_p, float max_p, float period_sec) {
+    currentPattern = pattern;
+    patternMinP = std::clamp(min_p, 1.0f, 60.0f);
+    patternMaxP = std::clamp(max_p, min_p + 1.0f, 70.0f);
+    patternPeriodSec = std::clamp(period_sec, 1.0f, 60.0f);
+}
+
 void post_mode_change(SystemMode newMode) {
     if (currentMode == newMode) return;
 
     ESP_LOGI(TAG, "Mode Transition: %d -> %d", (int)currentMode, (int)newMode);
     currentMode = newMode;
 
-    // Clear previous event bits
     if (sysEventGroup != NULL) {
         xEventGroupClearBits(sysEventGroup,
                              BIP_EVENT_MODE_IDLE | BIP_EVENT_MODE_MANUAL |
-                             BIP_EVENT_MODE_SMART | BIP_EVENT_MODE_BURST | BIP_EVENT_MODE_ERROR);
+                             BIP_EVENT_MODE_SMART | BIP_EVENT_MODE_BURST |
+                             BIP_EVENT_MODE_PULSE | BIP_EVENT_MODE_PATTERN |
+                             BIP_EVENT_MODE_ERROR);
     }
 
-    // Clean Entry Actions for new State
     reset_buffers();
 
     switch (newMode) {
@@ -115,6 +134,12 @@ void post_mode_change(SystemMode newMode) {
             burstPeak = 0.0f;
             safePopDataReady = false;
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_BURST);
+            break;
+        case MODE_PULSE:
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_PULSE);
+            break;
+        case MODE_PATTERN:
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_PATTERN);
             break;
         case MODE_CALIBRATION:
             pumpMotor.setTargetPWM(0);
@@ -142,18 +167,13 @@ void record_pop_sample(float p, float rawV, uint8_t pwm, float currentA) {
             safePopHeadIndex = liveWriteIndex;
             safePopDataReady = true;
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_POP_TRIGGERED);
-            ESP_LOGI(TAG, "POP CAPTURED! Executed fast memcpy into Safe RAM (4000 full-precision samples ready).");
+            ESP_LOGI(TAG, "POP CAPTURED! Executed fast memcpy into Safe RAM.");
         }
     }
 }
 
-bool is_pop_recorded() {
-    return safePopDataReady;
-}
-
-int get_pop_sample_count() {
-    return POP_BUF_SIZE;
-}
+bool is_pop_recorded() { return safePopDataReady; }
+int get_pop_sample_count() { return POP_BUF_SIZE; }
 
 PopBlackBoxSample get_pop_sample(int index) {
     if (index < 0 || index >= POP_BUF_SIZE || !safePopDataReady) {
@@ -164,16 +184,13 @@ PopBlackBoxSample get_pop_sample(int index) {
     return safePopRAMBuffer[realIdx];
 }
 
-float get_last_pop_peak() {
-    return burstPeak;
-}
+float get_last_pop_peak() { return burstPeak; }
 
 void dump_pop_recording() {
     if (!safePopDataReady) {
         printf("POP_DUMP_ERR,No_Pop_Captured\n");
         return;
     }
-
     printf("--- POP BLACK BOX SAFE RAM DUMP START (2000 SPS) ---\n");
     printf("Sample,Time_us,Pressure_kPa,Raw_Volts,PWM,Current_mA\n");
     for (int i = 0; i < POP_BUF_SIZE; i++) {
@@ -213,29 +230,20 @@ static void add_sample(float p) {
     }
 }
 
-float get_local_dp_dt() {
-    return current_dp_dt;
-}
-
-float get_local_d2p_dt2() {
-    return current_d2p_dt2;
-}
+float get_local_dp_dt() { return current_dp_dt; }
+float get_local_d2p_dt2() { return current_d2p_dt2; }
 
 float predict_local_pressure_forecast(int steps_ahead) {
     if (!bufFull) return pressureSensor.getValue();
-
     float p_curr = pressureSensor.getValue();
     int idx1 = (bufIndex + SG_WINDOW_SIZE - 1) % SG_WINDOW_SIZE;
     int idx2 = (bufIndex + SG_WINDOW_SIZE - 2) % SG_WINDOW_SIZE;
     int idx3 = (bufIndex + SG_WINDOW_SIZE - 3) % SG_WINDOW_SIZE;
-
     float x0 = pressureBuf[idx1];
     float x1 = pressureBuf[idx2];
     float x2 = pressureBuf[idx3];
-
     float pred = rls_weights[0] * x0 + rls_weights[1] * x1 + rls_weights[2] * x2;
     if (!std::isfinite(pred) || pred < 0.0f) pred = p_curr;
-    
     last_forecasted = pred;
     return pred;
 }
@@ -318,6 +326,80 @@ static void update_manual() {
     }
 }
 
+// -------------------------------------------------------------------
+// LOONER & BALLOON MODE: DYNAMIC BREATHING / HEARTBEAT PULSE GENERATOR
+// -------------------------------------------------------------------
+static void update_pulse() {
+    double t_sec = (double)esp_timer_get_time() / 1000000.0;
+    float sine_val = sinf(2.0f * M_PI * pulseFreqHz * (float)t_sec);
+    float dynamic_target = pulseBasePressure + (pulseAmplitude * sine_val);
+
+    float currentPressure = pressureSensor.getValue();
+    float error = dynamic_target - currentPressure;
+
+    int64_t now = esp_timer_get_time();
+    if (pid_lastTime == 0) pid_lastTime = now - 50000;
+    float dt = (float)(now - pid_lastTime) / 1000000.0f;
+    if (dt <= 0.001f) dt = 0.001f;
+    pid_lastTime = now;
+
+    pid_integral += error * dt;
+    pid_integral = std::clamp(pid_integral, -30.0f, 30.0f);
+
+    float output = (pid_Kff * dynamic_target) + (pid_Kp * error) + (pid_Ki * pid_integral);
+    int targetPWM = std::clamp((int)output, 0, 255);
+
+    // Dynamic Pressure Relief: If balloon pressure exceeds heartbeat apex, micro-open valve!
+    if (currentPressure > dynamic_target + 2.0f) {
+        write_solenoid_pwm(150); // Soft venting
+    } else {
+        write_solenoid_pwm(0);
+    }
+
+    pumpMotor.setTargetPWM(targetPWM);
+}
+
+// -------------------------------------------------------------------
+// LOONER & BALLOON MODE: RHYTHMIC WAVEFORM PATTERN PLAYER
+// -------------------------------------------------------------------
+static void update_pattern() {
+    double t_sec = (double)esp_timer_get_time() / 1000000.0;
+    float phase = fmod(t_sec, (double)patternPeriodSec) / patternPeriodSec; // 0.0 to 1.0
+    float target_p = patternMinP;
+
+    switch (currentPattern) {
+        case PATTERN_SINE:
+            target_p = patternMinP + ((patternMaxP - patternMinP) * 0.5f * (1.0f + sinf(2.0f * M_PI * phase)));
+            break;
+        case PATTERN_STAIRS:
+            {
+                int steps = 4;
+                int current_step = (int)(phase * steps);
+                target_p = patternMinP + ((patternMaxP - patternMinP) * ((float)current_step / (float)(steps - 1)));
+            }
+            break;
+        case PATTERN_TRIANGLE:
+            if (phase < 0.5f) {
+                target_p = patternMinP + ((patternMaxP - patternMinP) * (phase * 2.0f));
+            } else {
+                target_p = patternMaxP - ((patternMaxP - patternMinP) * ((phase - 0.5f) * 2.0f));
+            }
+            break;
+        case PATTERN_CRESCENDO:
+            {
+                // Pulsing with escalating amplitude up to max stretch
+                float pulse = sinf(2.0f * M_PI * phase * 5.0f);
+                target_p = patternMinP + ((patternMaxP - patternMinP) * phase) + (2.0f * pulse);
+            }
+            break;
+    }
+
+    float currentPressure = pressureSensor.getValue();
+    float error = target_p - currentPressure;
+    float output = (pid_Kff * target_p) + (pid_Kp * error);
+    pumpMotor.setTargetPWM(std::clamp((int)output, 0, 255));
+}
+
 static void update_smart() {
     float p = pressureSensor.getValue();
     add_sample(p);
@@ -394,6 +476,12 @@ void update_state_machine() {
             break;
         case MODE_BURST:
             update_burst();
+            break;
+        case MODE_PULSE:
+            update_pulse();
+            break;
+        case MODE_PATTERN:
+            update_pattern();
             break;
         case MODE_CALIBRATION:
             break;

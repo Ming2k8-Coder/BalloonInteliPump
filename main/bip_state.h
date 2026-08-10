@@ -13,8 +13,17 @@ enum SystemMode {
     MODE_MANUAL = 1,
     MODE_SMART = 2,
     MODE_BURST = 3,
-    MODE_CALIBRATION = 4,
-    MODE_ERROR = 5
+    MODE_PULSE = 4,      // Dynamic Breathing / Heartbeat Mode
+    MODE_PATTERN = 5,    // Rhythmic Waveform Player
+    MODE_CALIBRATION = 6,
+    MODE_ERROR = 7
+};
+
+enum WaveformPattern {
+    PATTERN_SINE = 0,
+    PATTERN_STAIRS = 1,
+    PATTERN_TRIANGLE = 2,
+    PATTERN_CRESCENDO = 3
 };
 
 // FreeRTOS Event Bits for Cross-Core Synchronization
@@ -22,9 +31,10 @@ enum SystemMode {
 #define BIP_EVENT_MODE_MANUAL     (1 << 1)
 #define BIP_EVENT_MODE_SMART      (1 << 2)
 #define BIP_EVENT_MODE_BURST      (1 << 3)
-#define BIP_EVENT_MODE_ERROR      (1 << 4)
-#define BIP_EVENT_POP_TRIGGERED   (1 << 5)
-#define BIP_EVENT_EMERGENCY_STOP  (1 << 6)
+#define BIP_EVENT_MODE_PULSE      (1 << 4)
+#define BIP_EVENT_MODE_PATTERN    (1 << 5)
+#define BIP_EVENT_MODE_ERROR      (1 << 6)
+#define BIP_EVENT_POP_TRIGGERED   (1 << 7)
 
 extern EventGroupHandle_t sysEventGroup;
 extern SystemMode currentMode;
@@ -39,6 +49,10 @@ void set_manual_mode(bool targetMode);
 void set_pid(float kp, float ki, float kd);
 void set_pid_feedforward(float kff);
 void trigger_error(const char* e1, const char* e2);
+
+// Looner & Balloon Specific Play Modes
+void set_pulse_params(float base_pressure, float amplitude, float frequency_hz);
+void set_pattern(WaveformPattern pattern, float min_p, float max_p, float period_sec);
 
 // Advanced Local Algorithms
 float get_local_dp_dt();

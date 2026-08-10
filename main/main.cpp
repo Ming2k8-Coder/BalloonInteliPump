@@ -202,6 +202,24 @@ static void execute_command(const char* cmd) {
         post_mode_change(MODE_SMART);
     } else if (strcmp(cmd, "START_BURST") == 0) {
         post_mode_change(MODE_BURST);
+    } else if (strcmp(cmd, "START_PULSE") == 0) {
+        post_mode_change(MODE_PULSE);
+        printf("PULSE_STARTED\n");
+    } else if (strncmp(cmd, "SET_PULSE ", 10) == 0) {
+        float base = 15.0f, amp = 3.0f, freq = 0.5f;
+        sscanf(cmd + 10, "%f %f %f", &base, &amp, &freq);
+        set_pulse_params(base, amp, freq);
+        post_mode_change(MODE_PULSE);
+        printf("PULSE_SET base=%.1f amp=%.1f freq=%.2f\n", base, amp, freq);
+    } else if (strcmp(cmd, "START_PATTERN") == 0) {
+        post_mode_change(MODE_PATTERN);
+        printf("PATTERN_STARTED\n");
+    } else if (strncmp(cmd, "SET_PATTERN ", 12) == 0) {
+        int pat = 0; float min_p = 10.0f, max_p = 25.0f, period = 10.0f;
+        sscanf(cmd + 12, "%d %f %f %f", &pat, &min_p, &max_p, &period);
+        set_pattern((WaveformPattern)pat, min_p, max_p, period);
+        post_mode_change(MODE_PATTERN);
+        printf("PATTERN_SET pat=%d min=%.1f max=%.1f period=%.1f\n", pat, min_p, max_p, period);
     } else if (strcmp(cmd, "STOP") == 0) {
         pumpMotor.emergencyStop();
         post_mode_change(MODE_IDLE);
