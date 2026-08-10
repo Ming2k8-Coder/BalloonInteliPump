@@ -47,8 +47,8 @@ graph TD
         RingBuf -->|Batch Read| Sockets
     end
 
-    Sockets <===>|UDP Broadcast Telemetry| Server
-    UART <===>|NMEA Commands (115200 Baud)| Server
+    Sockets <-->|"UDP Broadcast Telemetry"| Server
+    UART <-->|"NMEA Commands (115200 Baud)"| Server
 
     classDef core1 fill:#1e293b,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
     classDef core0 fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
