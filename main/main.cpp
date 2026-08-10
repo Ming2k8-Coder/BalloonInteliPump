@@ -41,7 +41,6 @@ static void execute_command(const char* cmd);
 static void control_task(void *pvParameters) {
     ESP_LOGI(TAG, "Control Task running on Core %d (Priority %d)", xPortGetCoreID(), uxTaskPriorityGet(NULL));
     
-    // Install DRDY GPIO Interrupt targeting this Task Handle for microsecond notification
     s_controlTaskHandle = xTaskGetCurrentTaskHandle();
     init_drdy_isr(s_controlTaskHandle);
 
@@ -73,7 +72,11 @@ static void control_task(void *pvParameters) {
         update_state_machine();
         totalSamplesProcessed++;
 
-        // 5. Zero-Copy Push to Lock-Free FreeRTOS RingBuffer for Core 0 Transmission
+        // 5. Continuous High-Precision Pop Black Box RAM Recording (2000 SPS)
+        record_pop_sample(pressureSensor.getValue(), pressureSensor.getRawValue(),
+                          pumpMotor.getCurrentPWM(), currentSensor.getValue());
+
+        // 6. Zero-Copy Push to Lock-Free FreeRTOS RingBuffer for Core 0 Transmission
         if (isConnected && telemetryRingBuf != NULL) {
             localSample.timestamp = (double)esp_timer_get_time() / 1000.0;
             localSample.pressure = pressureSensor.getValue();
@@ -226,9 +229,12 @@ static void execute_command(const char* cmd) {
     } else if (strcmp(cmd, "ZERO_PRESSURE") == 0 || strcmp(cmd, "ZERO_TARE") == 0) {
         pressureSensor.tare();
         printf("PRESSURE_ZEROED\n");
+    } else if (strcmp(cmd, "GET_POP_DUMP") == 0 || strcmp(cmd, "DUMP_POP") == 0) {
+        dump_pop_recording();
     } else if (strcmp(cmd, "GET_DIAGNOSTICS") == 0 || strcmp(cmd, "STATUS") == 0) {
-        printf("DIAG,uptime=%lld,heap=%lu,mcu_temp=%.1f,mode=%d,samples=%lu\n",
-               esp_timer_get_time() / 1000000, esp_get_free_heap_size(), read_mcu_temp(), (int)currentMode, totalSamplesProcessed);
+        printf("DIAG,uptime=%lld,heap=%lu,mcu_temp=%.1f,mode=%d,samples=%lu,pop_recorded=%d\n",
+               esp_timer_get_time() / 1000000, esp_get_free_heap_size(), read_mcu_temp(),
+               (int)currentMode, totalSamplesProcessed, is_pop_recorded() ? 1 : 0);
     } else if (strcmp(cmd, "CAL_SAVE") == 0) {
         save_system_config();
         printf("CAL_SAVED\n");

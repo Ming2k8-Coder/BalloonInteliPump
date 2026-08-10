@@ -51,6 +51,9 @@
 #define TELEM_BUFFER_SIZE   10
 #define TELEM_RING_BUF_SIZE (32 * 1024) // 32 KB Lock-Free RingBuffer
 
+// Full-Precision Pop Black Box RAM Buffer (2000 Samples @ 2000 SPS = 1.0 Sec Full Precision)
+#define POP_BUF_SIZE        2000
+
 // Task Priorities & Cores
 #define CONTROL_TASK_PRIO   12 // Real-time priority
 #define CONTROL_TASK_CORE   1  // Dedicated Core 1 for DSP/Control
@@ -74,5 +77,14 @@ typedef struct {
     float rawCurrent;
     float mcuTemp;
 } TelemetrySample;
+
+// Full Precision Pop Black Box Sample Structure (16 bytes)
+typedef struct {
+    uint32_t timestamp_us; // Microsecond timestamp
+    float pressure;        // Calibrated pressure (kPa)
+    float rawVolts;        // Raw 24-bit ADC voltage
+    uint16_t pwm;          // Motor PWM
+    uint16_t current_ma;   // Motor current (mA)
+} PopBlackBoxSample;
 
 #endif // BIP_CONFIG_H

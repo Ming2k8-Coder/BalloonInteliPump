@@ -30,4 +30,12 @@ float get_local_dp_dt();
 float get_local_d2p_dt2();
 float predict_local_pressure_forecast(int steps_ahead);
 
+// High-Precision Pop Black Box RAM Recording
+void record_pop_sample(float p, float rawV, uint8_t pwm, float currentA);
+bool is_pop_recorded();
+int get_pop_sample_count();
+PopBlackBoxSample get_pop_sample(int index);
+float get_last_pop_peak();
+void dump_pop_recording();
+
 #endif // BIP_STATE_H

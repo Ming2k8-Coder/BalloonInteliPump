@@ -33,12 +33,12 @@ static float manualTargetPressure = 20.0f;
 static float pid_Kp = 25.0f;
 static float pid_Ki = 1.2f;
 static float pid_Kd = 4.0f;
-static float pid_Kff = 3.5f; // Feedforward gain (PWM per kPa)
+static float pid_Kff = 3.5f;
 static float pid_integral = 0.0f;
 static float pid_lastError = 0.0f;
 static int64_t pid_lastTime = 0;
 
-// Savitzky-Golay FIR Filter Buffer for 1st (dP/dt) & 2nd (d2P/dt2) Derivatives
+// Savitzky-Golay FIR Filter Buffer
 #define SG_WINDOW_SIZE 9
 static float pressureBuf[SG_WINDOW_SIZE] = {0};
 static int64_t timeBuf[SG_WINDOW_SIZE] = {0};
@@ -48,10 +48,78 @@ static bool bufFull = false;
 static float current_dp_dt = 0.0f;
 static float current_d2p_dt2 = 0.0f;
 
-// On-Device RLS Predictor State
+// RLS Predictor State
 static float rls_weights[3] = { 0.8f, 0.15f, 0.05f };
-static float rls_p_matrix[3][3] = { {100.0f, 0, 0}, {0, 100.0f, 0}, {0, 0, 100.0f} };
 static float last_forecasted = 0.0f;
+
+// ----------------------------------------------------
+// FULL-PRECISION POP BLACK BOX RAM BUFFER (2000 SPS)
+// ----------------------------------------------------
+static PopBlackBoxSample popRamBuffer[POP_BUF_SIZE];
+static int popWriteIndex = 0;
+static bool popBufferFrozen = false;
+static int postPopHoldCountdown = 0;
+static float burstPeak = 0.0f;
+static bool burstPopped = false;
+
+void record_pop_sample(float p, float rawV, uint8_t pwm, float currentA) {
+    if (popBufferFrozen) return;
+
+    popRamBuffer[popWriteIndex].timestamp_us = (uint32_t)esp_timer_get_time();
+    popRamBuffer[popWriteIndex].pressure = p;
+    popRamBuffer[popWriteIndex].rawVolts = rawV;
+    popRamBuffer[popWriteIndex].pwm = (uint16_t)pwm;
+    popRamBuffer[popWriteIndex].current_ma = (uint16_t)(currentA * 1000.0f);
+
+    popWriteIndex = (popWriteIndex + 1) % POP_BUF_SIZE;
+
+    // If pop was triggered, record 1000 post-pop samples then freeze buffer
+    if (postPopHoldCountdown > 0) {
+        postPopHoldCountdown--;
+        if (postPopHoldCountdown == 0) {
+            popBufferFrozen = true;
+            ESP_LOGI(TAG, "Pop Black Box RAM Recording FROZEN! 2000 full-precision samples captured.");
+        }
+    }
+}
+
+bool is_pop_recorded() {
+    return popBufferFrozen;
+}
+
+int get_pop_sample_count() {
+    return POP_BUF_SIZE;
+}
+
+PopBlackBoxSample get_pop_sample(int index) {
+    if (index < 0 || index >= POP_BUF_SIZE) {
+        PopBlackBoxSample empty = {};
+        return empty;
+    }
+    // Ordered read from oldest to newest relative to current frozen head
+    int realIdx = (popWriteIndex + index) % POP_BUF_SIZE;
+    return popRamBuffer[realIdx];
+}
+
+float get_last_pop_peak() {
+    return burstPeak;
+}
+
+void dump_pop_recording() {
+    if (!popBufferFrozen) {
+        printf("POP_DUMP_ERR,Not_Frozen\n");
+        return;
+    }
+
+    printf("--- POP BLACK BOX HIGH-PRECISION RAM DUMP START (2000 SPS) ---\n");
+    printf("Sample,Time_us,Pressure_kPa,Raw_Volts,PWM,Current_mA\n");
+    for (int i = 0; i < POP_BUF_SIZE; i++) {
+        PopBlackBoxSample s = get_pop_sample(i);
+        printf("%d,%lu,%.4f,%.6f,%u,%u\n",
+               i, (unsigned long)s.timestamp_us, s.pressure, s.rawVolts, s.pwm, s.current_ma);
+    }
+    printf("--- POP BLACK BOX DUMP END ---\n");
+}
 
 static void reset_buffers() {
     memset(pressureBuf, 0, sizeof(pressureBuf));
@@ -60,6 +128,9 @@ static void reset_buffers() {
     bufFull = false;
     current_dp_dt = 0.0f;
     current_d2p_dt2 = 0.0f;
+    popWriteIndex = 0;
+    popBufferFrozen = false;
+    postPopHoldCountdown = 0;
 }
 
 static void add_sample(float p) {
@@ -69,8 +140,6 @@ static void add_sample(float p) {
     if (bufIndex == 0) bufFull = true;
 
     if (bufFull) {
-        // Savitzky-Golay FIR 9-point derivative approximation
-        // dP/dt: 1st Derivative Savitzky-Golay coefficients [-4, -3, -2, -1, 0, 1, 2, 3, 4] / 60
         float num_dp = 0.0f;
         float num_d2p = 0.0f;
         int coeffs_1st[9] = { -4, -3, -2, -1, 0, 1, 2, 3, 4 };
@@ -101,7 +170,6 @@ float get_local_d2p_dt2() {
     return current_d2p_dt2;
 }
 
-// On-Device RLS Predictor
 float predict_local_pressure_forecast(int steps_ahead) {
     if (!bufFull) return pressureSensor.getValue();
 
@@ -114,17 +182,12 @@ float predict_local_pressure_forecast(int steps_ahead) {
     float x1 = pressureBuf[idx2];
     float x2 = pressureBuf[idx3];
 
-    // 1-step forecast
     float pred = rls_weights[0] * x0 + rls_weights[1] * x1 + rls_weights[2] * x2;
     if (!std::isfinite(pred) || pred < 0.0f) pred = p_curr;
     
     last_forecasted = pred;
     return pred;
 }
-
-// Burst Mode Variables
-static float burstPeak = 0.0f;
-static bool burstPopped = false;
 
 void init_states() {
     currentMode = MODE_IDLE;
@@ -198,7 +261,6 @@ static void update_manual() {
         derivative = 0.7f * derivative + 0.3f * raw_derivative;
         pid_lastError = error;
         
-        // Feedforward calculation
         float feedforward = pid_Kff * manualTargetPressure;
         float output = feedforward + (pid_Kp * error) + (pid_Ki * pid_integral) + (pid_Kd * derivative);
         int targetPWM = std::clamp((int)output, 0, 255);
@@ -225,7 +287,6 @@ static void update_smart() {
                 float slope = get_local_dp_dt();
                 float d2p = get_local_d2p_dt2();
 
-                // Inflection yield point: p > 5.0kPa AND slope drop AND 2nd derivative turns negative
                 if (p > 5.0f && (slope <= 0.15f || d2p < -0.5f)) {
                     detectedYieldPressure = peakPressureTracker;
                     smartState = SMART_INFLATING_TARGET;
@@ -250,21 +311,24 @@ static void update_smart() {
 }
 
 static void update_burst() {
+    float p = pressureSensor.getValue();
+    add_sample(p);
+
     if (burstPopped) {
         if (pumpMotor.getCurrentPWM() > 0) pumpMotor.emergencyStop();
         return;
     }
     
-    float p = pressureSensor.getValue();
-    add_sample(p);
-
     if (p > burstPeak) burstPeak = p;
     
     pumpMotor.setTargetPWM(255);
     
-    if (burstPeak > 10.0f && p < burstPeak * 0.8f) {
+    // Pop Trigger Detection: Pressure drops > 20% from peak
+    if (burstPeak > 10.0f && p < burstPeak * 0.8f && postPopHoldCountdown == 0 && !popBufferFrozen) {
         pumpMotor.emergencyStop();
         burstPopped = true;
+        postPopHoldCountdown = 1000; // Capture 1000 post-pop samples (500ms) then freeze RAM
+        ESP_LOGI(TAG, "POP DETECTED! Peak: %.2f kPa. Recording 1000 post-pop samples...", burstPeak);
     }
 }
 
