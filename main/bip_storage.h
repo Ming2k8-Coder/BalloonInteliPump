@@ -12,6 +12,7 @@ typedef struct {
     SensorCalibration voltageCal;
     SensorCalibration currentCal;
     SafetySettings motorSafety;
+    float learnedBurstThreshold;
 } SystemConfig;
 
 esp_err_t init_storage();
@@ -19,3 +20,4 @@ esp_err_t save_system_config();
 esp_err_t load_system_config();
 
 #endif // BIP_STORAGE_H
+

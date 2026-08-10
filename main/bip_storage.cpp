@@ -1,4 +1,5 @@
 #include "bip_storage.h"
+#include "bip_balloon_physics.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -23,16 +24,17 @@ esp_err_t save_system_config() {
     if (err != ESP_OK) return err;
 
     SystemConfig cfg = {};
-    cfg.version = 1;
+    cfg.version = 2;
     cfg.pressureCal = pressureSensor.getCalibration();
     cfg.voltageCal = voltageSensor.getCalibration();
     cfg.currentCal = currentSensor.getCalibration();
     cfg.motorSafety = pumpMotor.getSafetySettings();
+    cfg.learnedBurstThreshold = get_learned_burst_threshold();
 
     err = nvs_set_blob(my_handle, NVS_CFG_KEY, &cfg, sizeof(SystemConfig));
     if (err == ESP_OK) {
         err = nvs_commit(my_handle);
-        ESP_LOGI(TAG, "System configuration saved to NVS storage");
+        ESP_LOGI(TAG, "System configuration saved to NVS storage (Learned Burst Thresh: %.2f)", cfg.learnedBurstThreshold);
     }
     nvs_close(my_handle);
     return err;
@@ -51,8 +53,12 @@ esp_err_t load_system_config() {
         voltageSensor.setCalibration(cfg.voltageCal);
         currentSensor.setCalibration(cfg.currentCal);
         pumpMotor.setSafetySettings(cfg.motorSafety);
+        if (cfg.learnedBurstThreshold < -10.0f) {
+            set_learned_burst_threshold(cfg.learnedBurstThreshold);
+        }
         ESP_LOGI(TAG, "System configuration restored from NVS storage");
     }
     nvs_close(my_handle);
     return err;
 }
+

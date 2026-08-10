@@ -1,4 +1,6 @@
 #include "bip_state.h"
+#include "bip_balloon_physics.h"
+#include "bip_volume_estimator.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <cmath>
@@ -33,13 +35,52 @@ static float manualTargetPressure = 20.0f;
 // Pulse / Breathing Mode Variables
 static float pulseBasePressure = 15.0f;
 static float pulseAmplitude = 3.0f;
-static float pulseFreqHz = 0.5f; // 0.5 Hz heartbeat pulse
+static float pulseFreqHz = 0.5f;
 
 // Pattern Mode Variables
 static WaveformPattern currentPattern = PATTERN_SINE;
 static float patternMinP = 10.0f;
 static float patternMaxP = 25.0f;
 static float patternPeriodSec = 10.0f;
+
+// Idea #6: Diameter Mode Variables
+static float targetDiameterCm = 25.0f;
+
+// Idea #11: Ride Mode Variables
+static float riderWeightKg = 70.0f;
+static float targetSinkCm = 8.0f;
+static float rideBaselinePressure = 0.0f;
+static int64_t rideStartTimeUs = 0;
+
+// Idea #12: Bounce Rhythm Detector State
+static BounceRhythmState bounceRhythm = {};
+static int64_t lastBouncePeakTimeUs = 0;
+static float bouncePeriodEmaMs = 0.0f;
+static int consecutiveBouncePeriods = 0;
+static float prevDpDtForPeak = 0.0f;
+
+// Idea #14: Conditioning Mode Sub-State Machine
+typedef enum {
+    COND_IDLE = 0,
+    COND_RAMP_INFLATE,
+    COND_RELAX_HOLD,
+    COND_CONTROLLED_DEFLATE,
+    COND_ANALYZE_LOOP,
+    COND_FINISHED
+} ConditioningSubPhase;
+
+static ConditioningSubPhase condPhase = COND_IDLE;
+static int condCurrentCycle = 0;
+static int condMaxCycles = 4;
+static int64_t condPhaseStartUs = 0;
+static float condYieldPressures[6] = {0};
+static float condPeakPressures[6] = {0};
+static float condSofteningPct = 0.0f;
+static float condConvergencePct = 0.0f;
+static bool condComplete = false;
+
+// Idea #4: Hysteresis Band Settings
+static float pid_hysteresis_band = 0.5f; // ±0.5 kPa deadband
 
 // Advanced PID Controller with Feedforward
 static float pid_Kp = 25.0f;
@@ -86,6 +127,8 @@ static void reset_buffers() {
     pid_integral = 0;
     pid_lastError = 0;
     pid_lastTime = 0;
+    rideStartTimeUs = 0;
+    rideBaselinePressure = 0.0f;
 }
 
 void set_pulse_params(float base_pressure, float amplitude, float frequency_hz) {
@@ -101,6 +144,46 @@ void set_pattern(WaveformPattern pattern, float min_p, float max_p, float period
     patternPeriodSec = std::clamp(period_sec, 1.0f, 60.0f);
 }
 
+void set_target_diameter(float diameter_cm) {
+    targetDiameterCm = std::clamp(diameter_cm, 5.0f, 120.0f);
+    pid_lastTime = 0;
+    pid_integral = 0;
+    post_mode_change(MODE_DIAMETER);
+    ESP_LOGI(TAG, "Target Diameter set to %.1f cm", targetDiameterCm);
+}
+
+void set_ride_params(float rider_weight_kg, float sink_depth_cm) {
+    riderWeightKg = std::clamp(rider_weight_kg, 20.0f, 200.0f);
+    targetSinkCm = std::clamp(sink_depth_cm, 2.0f, 25.0f);
+    rideStartTimeUs = 0;
+    post_mode_change(MODE_RIDE);
+    ESP_LOGI(TAG, "Ride Params updated: Rider %.1f kg, Sink %.1f cm", riderWeightKg, targetSinkCm);
+}
+
+BounceRhythmState get_bounce_rhythm() {
+    return bounceRhythm;
+}
+
+void start_balloon_conditioning(int cycles) {
+    condMaxCycles = std::clamp(cycles, 2, 6);
+    condCurrentCycle = 1;
+    condComplete = false;
+    condPhase = COND_RAMP_INFLATE;
+    condPhaseStartUs = esp_timer_get_time();
+    memset(condYieldPressures, 0, sizeof(condYieldPressures));
+    memset(condPeakPressures, 0, sizeof(condPeakPressures));
+    post_mode_change(MODE_CONDITION);
+    ESP_LOGI(TAG, "Automated Balloon Conditioning Started (%d Cycles Target)", condMaxCycles);
+}
+
+bool is_conditioning_complete() {
+    return condComplete;
+}
+
+void set_hysteresis_band(float deadband_kpa) {
+    pid_hysteresis_band = std::clamp(deadband_kpa, 0.0f, 3.0f);
+}
+
 void post_mode_change(SystemMode newMode) {
     if (currentMode == newMode) return;
 
@@ -112,7 +195,8 @@ void post_mode_change(SystemMode newMode) {
                              BIP_EVENT_MODE_IDLE | BIP_EVENT_MODE_MANUAL |
                              BIP_EVENT_MODE_SMART | BIP_EVENT_MODE_BURST |
                              BIP_EVENT_MODE_PULSE | BIP_EVENT_MODE_PATTERN |
-                             BIP_EVENT_MODE_ERROR);
+                             BIP_EVENT_MODE_ERROR | BIP_EVENT_MODE_RIDE |
+                             BIP_EVENT_MODE_DIAMETER);
     }
 
     reset_buffers();
@@ -120,6 +204,7 @@ void post_mode_change(SystemMode newMode) {
     switch (newMode) {
         case MODE_IDLE:
             pumpMotor.setTargetPWM(0);
+            write_solenoid_pwm(0);
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_IDLE);
             break;
         case MODE_MANUAL:
@@ -141,11 +226,20 @@ void post_mode_change(SystemMode newMode) {
         case MODE_PATTERN:
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_PATTERN);
             break;
+        case MODE_DIAMETER:
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_DIAMETER);
+            break;
+        case MODE_RIDE:
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_RIDE);
+            break;
+        case MODE_CONDITION:
+            break;
         case MODE_CALIBRATION:
             pumpMotor.setTargetPWM(0);
             break;
         case MODE_ERROR:
             pumpMotor.emergencyStop();
+            write_solenoid_pwm(255);
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_ERROR);
             break;
     }
@@ -168,6 +262,7 @@ void record_pop_sample(float p, float rawV, uint8_t pwm, float currentA) {
             safePopDataReady = true;
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_POP_TRIGGERED);
             ESP_LOGI(TAG, "POP CAPTURED! Executed fast memcpy into Safe RAM.");
+            update_burst_threshold_from_pop();
         }
     }
 }
@@ -326,9 +421,201 @@ static void update_manual() {
     }
 }
 
-// -------------------------------------------------------------------
-// LOONER & BALLOON MODE: DYNAMIC BREATHING / HEARTBEAT PULSE GENERATOR
-// -------------------------------------------------------------------
+// Idea #6: Closed-Loop Balloon Diameter Controller
+static void update_diameter() {
+    BalloonPhysicsEstimate est = get_balloon_physics_estimate();
+    BalloonMaterialPhysics phys = get_balloon_physics_state();
+
+    if (phys.yield_probability > 0.88f) {
+        pumpMotor.emergencyStop();
+        trigger_error("DIAMETER", "Rupture risk > 88%");
+        return;
+    }
+
+    float currentDiameter = est.diameter_cm;
+    float error = targetDiameterCm - currentDiameter;
+
+    int64_t now = esp_timer_get_time();
+    if (pid_lastTime == 0) pid_lastTime = now - 50000;
+    float dt = (float)(now - pid_lastTime) / 1000000.0f;
+    if (dt <= 0.001f) dt = 0.001f;
+    pid_lastTime = now;
+
+    if (std::abs(error) < 5.0f) pid_integral += error * dt;
+    else pid_integral = 0.0f;
+    pid_integral = std::clamp(pid_integral, -20.0f, 20.0f);
+
+    float output = (pid_Kp * 1.5f * error) + (pid_Ki * pid_integral) + (pid_Kff * 1.2f * targetDiameterCm);
+    pumpMotor.setTargetPWM(std::clamp((int)output, 0, 255));
+
+    if (error < -1.0f) write_solenoid_pwm(140);
+    else write_solenoid_pwm(0);
+}
+
+// Idea #12: Bounce Rhythm Detector Algorithm
+static void update_bounce_rhythm_detector(float dp_dt, float pressure_kpa) {
+    int64_t now = esp_timer_get_time();
+
+    if (prevDpDtForPeak > 12.0f && dp_dt < 0.0f && pressure_kpa > 4.0f) {
+        if (lastBouncePeakTimeUs > 0) {
+            float measured_period_ms = (float)(now - lastBouncePeakTimeUs) / 1000.0f;
+            if (measured_period_ms >= 250.0f && measured_period_ms <= 2000.0f) {
+                if (bouncePeriodEmaMs <= 0.0f) bouncePeriodEmaMs = measured_period_ms;
+                else bouncePeriodEmaMs = 0.70f * bouncePeriodEmaMs + 0.30f * measured_period_ms;
+
+                consecutiveBouncePeriods++;
+                bounceRhythm.bounce_count++;
+                record_bounce_cycle(get_balloon_physics_state().hyperelastic_stress_kpa);
+            }
+        }
+        lastBouncePeakTimeUs = now;
+    }
+    prevDpDtForPeak = dp_dt;
+
+    bounceRhythm.rhythm_locked = (consecutiveBouncePeriods >= 4 && bouncePeriodEmaMs > 200.0f);
+    if (bounceRhythm.rhythm_locked) {
+        bounceRhythm.period_ms = bouncePeriodEmaMs;
+        bounceRhythm.frequency_hz = 1000.0f / bouncePeriodEmaMs;
+        float elapsed_in_cycle = (float)(now - lastBouncePeakTimeUs) / 1000.0f;
+        bounceRhythm.phase_angle = fmodf(elapsed_in_cycle / bouncePeriodEmaMs, 1.0f);
+    }
+}
+
+// Idea #11: Ride Mode Active Weight-Bearing Pressure Controller
+static void update_ride() {
+    float p = pressureSensor.getValue();
+    float dp_dt = get_local_dp_dt();
+    int64_t now = esp_timer_get_time();
+
+    if (rideStartTimeUs == 0) {
+        rideStartTimeUs = now;
+        rideBaselinePressure = p;
+        return;
+    }
+
+    update_bounce_rhythm_detector(dp_dt, p);
+
+    RideInflationAdvice advice = compute_ride_inflation(riderWeightKg, BALLOON_36INCH, 0.5f);
+    float p_target_ride = advice.recommended_pressure_kpa;
+
+    static float slow_leak_integral = 0.0f;
+    float slow_error = p_target_ride - rideBaselinePressure;
+    slow_leak_integral += slow_error * 0.0005f;
+    slow_leak_integral = std::clamp(slow_leak_integral, 0.0f, 180.0f);
+
+    bool airborne_phase = (p < rideBaselinePressure + 2.5f);
+    if (bounceRhythm.rhythm_locked) {
+        airborne_phase = (bounceRhythm.phase_angle > 0.55f && bounceRhythm.phase_angle < 0.95f);
+    }
+
+    if (airborne_phase && slow_leak_integral > 10.0f) {
+        pumpMotor.setTargetPWM(std::clamp((int)slow_leak_integral, 50, 200));
+    } else {
+        pumpMotor.setTargetPWM(0);
+    }
+
+    if (p > advice.max_safe_pressure_kpa) {
+        write_solenoid_pwm(180);
+    } else {
+        write_solenoid_pwm(0);
+    }
+}
+
+// Idea #14: Automated Latex Pre-Conditioning Protocol State Engine
+static void update_conditioning() {
+    float p = pressureSensor.getValue();
+    float dp_dt = get_local_dp_dt();
+    float d2p = get_local_d2p_dt2();
+    int64_t now = esp_timer_get_time();
+    float elapsed_sec = (float)(now - condPhaseStartUs) / 1000000.0f;
+
+    switch (condPhase) {
+        case COND_IDLE:
+            pumpMotor.setTargetPWM(0);
+            write_solenoid_pwm(0);
+            break;
+
+        case COND_RAMP_INFLATE: {
+            float cycle_scale = 0.60f + (0.08f * (condCurrentCycle - 1));
+            float target_p_limit = 28.0f * cycle_scale;
+
+            pumpMotor.setTargetPWM(160);
+            write_solenoid_pwm(0);
+
+            bool yield_detected = (p > 4.0f && dp_dt < 0.12f && d2p < -0.3f);
+            bool limit_reached = (p >= target_p_limit);
+
+            if (yield_detected || limit_reached) {
+                condPeakPressures[condCurrentCycle - 1] = p;
+                condYieldPressures[condCurrentCycle - 1] = yield_detected ? p : target_p_limit;
+                pumpMotor.setTargetPWM(0);
+                condPhase = COND_RELAX_HOLD;
+                condPhaseStartUs = now;
+                ESP_LOGI(TAG, "Conditioning Cycle %d Peak: %.2f kPa. Relaxing...", condCurrentCycle, p);
+            }
+            break;
+        }
+
+        case COND_RELAX_HOLD: {
+            pumpMotor.setTargetPWM(0);
+            write_solenoid_pwm(0);
+
+            if (elapsed_sec >= 10.0f || (elapsed_sec >= 4.0f && std::fabs(dp_dt) < 0.02f)) {
+                condPhase = COND_CONTROLLED_DEFLATE;
+                condPhaseStartUs = now;
+            }
+            break;
+        }
+
+        case COND_CONTROLLED_DEFLATE: {
+            pumpMotor.setTargetPWM(0);
+            write_solenoid_pwm(140);
+
+            if (p <= 2.0f || elapsed_sec >= 15.0f) {
+                write_solenoid_pwm(0);
+                condPhase = COND_ANALYZE_LOOP;
+                condPhaseStartUs = now;
+            }
+            break;
+        }
+
+        case COND_ANALYZE_LOOP: {
+            write_solenoid_pwm(0);
+            float cycle1_p = condYieldPressures[0];
+            float curr_p = condYieldPressures[condCurrentCycle - 1];
+            if (cycle1_p > 0.01f) condSofteningPct = (1.0f - (curr_p / cycle1_p)) * 100.0f;
+
+            if (condCurrentCycle >= 2) {
+                float prev_p = condYieldPressures[condCurrentCycle - 2];
+                if (prev_p > 0.01f) condConvergencePct = (std::fabs(curr_p - prev_p) / prev_p) * 100.0f;
+            } else {
+                condConvergencePct = 99.0f;
+            }
+
+            ESP_LOGI(TAG, "Conditioning Cycle %d Analyzed -> Softening: %.1f%%, Loop Delta: %.2f%%",
+                     condCurrentCycle, condSofteningPct, condConvergencePct);
+
+            if ((condCurrentCycle >= 3 && condConvergencePct < 2.5f) || condCurrentCycle >= condMaxCycles) {
+                condComplete = true;
+                condPhase = COND_FINISHED;
+                ESP_LOGI(TAG, "CONDITIONING COMPLETE! Softening: %.1f%%", condSofteningPct);
+                post_mode_change(MODE_IDLE);
+            } else {
+                condCurrentCycle++;
+                condPhase = COND_RAMP_INFLATE;
+                condPhaseStartUs = now;
+            }
+            break;
+        }
+
+        case COND_FINISHED:
+            pumpMotor.setTargetPWM(0);
+            write_solenoid_pwm(0);
+            break;
+    }
+}
+
+// Idea #4: Pulse Breathing Mode with Hysteresis Banding
 static void update_pulse() {
     double t_sec = (double)esp_timer_get_time() / 1000000.0;
     float sine_val = sinf(2.0f * M_PI * pulseFreqHz * (float)t_sec);
@@ -349,22 +636,19 @@ static void update_pulse() {
     float output = (pid_Kff * dynamic_target) + (pid_Kp * error) + (pid_Ki * pid_integral);
     int targetPWM = std::clamp((int)output, 0, 255);
 
-    // Dynamic Pressure Relief: If balloon pressure exceeds heartbeat apex, micro-open valve!
-    if (currentPressure > dynamic_target + 2.0f) {
-        write_solenoid_pwm(150); // Soft venting
-    } else {
+    // Idea #4: Hysteresis deadband valve control to stop chattering
+    if (currentPressure > dynamic_target + pid_hysteresis_band + 1.5f) {
+        write_solenoid_pwm(150);
+    } else if (currentPressure < dynamic_target + pid_hysteresis_band) {
         write_solenoid_pwm(0);
     }
 
     pumpMotor.setTargetPWM(targetPWM);
 }
 
-// -------------------------------------------------------------------
-// LOONER & BALLOON MODE: RHYTHMIC WAVEFORM PATTERN PLAYER
-// -------------------------------------------------------------------
 static void update_pattern() {
     double t_sec = (double)esp_timer_get_time() / 1000000.0;
-    float phase = fmod(t_sec, (double)patternPeriodSec) / patternPeriodSec; // 0.0 to 1.0
+    float phase = fmod(t_sec, (double)patternPeriodSec) / patternPeriodSec;
     float target_p = patternMinP;
 
     switch (currentPattern) {
@@ -387,7 +671,6 @@ static void update_pattern() {
             break;
         case PATTERN_CRESCENDO:
             {
-                // Pulsing with escalating amplitude up to max stretch
                 float pulse = sinf(2.0f * M_PI * phase * 5.0f);
                 target_p = patternMinP + ((patternMaxP - patternMinP) * phase) + (2.0f * pulse);
             }
@@ -483,6 +766,15 @@ void update_state_machine() {
         case MODE_PATTERN:
             update_pattern();
             break;
+        case MODE_DIAMETER:
+            update_diameter();
+            break;
+        case MODE_RIDE:
+            update_ride();
+            break;
+        case MODE_CONDITION:
+            update_conditioning();
+            break;
         case MODE_CALIBRATION:
             break;
         case MODE_ERROR:
@@ -490,3 +782,4 @@ void update_state_machine() {
             break;
     }
 }
+

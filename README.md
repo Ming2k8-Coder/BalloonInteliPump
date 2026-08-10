@@ -70,16 +70,19 @@ graph TD
 
 ## ⚡ Key Technical Features
 
-- **Mooney-Rivlin Hyperelastic Latex Model (`bip_balloon_physics`):** Calculates real-time latex stretch ratio ($\lambda = D/D_0$), hyperelastic strain energy ($W_{\text{Joules}}$), and material yield risk factor.
-- **Acoustic & Mechanical Burst Shock Engine:** Detects rapid pressure collapses ($dP/dt < -40\text{ kPa/s}$) to distinguish popping from venting and execute microsecond motor cutoff.
-- **Real-Time Balloon Volume & Stretch Estimator (`bip_volume_estimator`):** Continuous integration of air volume ($V_{\text{liters}}$) and estimated balloon diameter ($D_{\text{cm}}$).
-- **Microsecond Hardware DRDY Interrupt:** Synced to 2000 SPS ADS1220 24-bit SPI ADC using FreeRTOS Direct Task Notifications (`vTaskNotifyGiveFromISR`).
-- **1D Adaptive Kalman Filter:** Zero-phase-lag digital filtering for high-precision pressure readings.
-- **Savitzky-Golay 9-Point FIR Derivative Filter:** Computes 1st ($dP/dt$) and 2nd ($d^2P/dt^2$) analytical derivatives for inflection yield detection.
+- **Mooney-Rivlin Hyperelastic & SLS Viscoelastic Model (`bip_balloon_physics`):** Calculates real-time latex stretch ratio ($\lambda = D/D_0$), Mooney-Rivlin wall stress ($\sigma_{\text{kPa}}$), Standard Linear Solid (SLS) creep relaxation, and thermal softening adjustments.
+- **Bounce Shock Absorber & Impact Classifier:** Distinguishes elastic bouncing ($+dP/dt$ compression followed by rebound) from true burst collapse to prevent false emergency stops during sit-and-bounce play.
+- **Miner's Rule Cyclic Fatigue Tracker:** Calculates accumulated damage ($D$) and safe pressure derating over hundreds of bounce cycles.
+- **Active Weight-Bearing Ride Controller (`MODE_RIDE`):** Hertz contact mechanics-based firmness controller for body-weight loading with airborne phase-locked pump replenishment.
+- **Closed-Loop Balloon Diameter Control (`MODE_DIAMETER`):** Closed-loop PID setpoint control directly on estimated balloon diameter ($D_{\text{cm}}$).
+- **Automated Latex Pre-Conditioning Engine (`MODE_CONDITION`):** Multi-cycle pre-stretching protocol (Mullins effect softening) with real-time hysteresis loop convergence tracking.
+- **Hammerstein Pump Model & Gas Law Correction:** Non-linear motor deadzone compensation and $PV=nRT$ air density temperature correction.
+- **Adaptive Burst Threshold Learning:** Auto-tunes burst detection threshold from past Pop Black Box RAM data.
 - **4000-Sample Pop Black Box RAM Buffer:** 2.0-second full precision recording (1.5s pre-pop yield + 0.5s post-pop collapse) with <18µs fast `memcpy()` to safe RAM.
-- **Dynamic Breathing Heartbeat Mode (`MODE_PULSE`):** Rhythmic $0.1\text{--}2.0\text{ Hz}$ sine pulse generator for living balloon feel with automatic safety relief venting.
+- **Dynamic Breathing Heartbeat Mode (`MODE_PULSE`):** Rhythmic $0.1\text{--}2.0\text{ Hz}$ sine pulse generator with hysteresis deadband relief venting.
 - **Rhythmic Waveform Pattern Player (`MODE_PATTERN`):** Plays Sine, Stairs, Triangle, and Crescendo pressure cycles.
 - **Automated Hardware Self-Test Engine:** `RUN_SELF_TEST` diagnostic verification of SPI ADC, MCU thermal sensor, and PWM drivers.
+
 
 ---
 

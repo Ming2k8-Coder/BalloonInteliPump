@@ -73,8 +73,9 @@ static void control_task(void *pvParameters) {
 
         // 4. Update PID & State Machine
         update_state_machine();
-        update_volume_estimator(pressureSensor.getValue(), (float)pumpMotor.getCurrentPWM(), 0.0005f);
-        update_balloon_physics(pressureSensor.getValue(), get_local_dp_dt(), 0.0005f);
+        float mcu_temp = read_mcu_temp();
+        update_volume_estimator_ext(pressureSensor.getValue(), (float)pumpMotor.getCurrentPWM(), mcu_temp, 0.0005f);
+        update_balloon_physics_ext(pressureSensor.getValue(), get_local_dp_dt(), get_local_d2p_dt2(), mcu_temp, 0.0005f);
         totalSamplesProcessed++;
 
         // 5. Continuous High-Precision Pop Black Box RAM Recording (2000 SPS)
@@ -92,7 +93,7 @@ static void control_task(void *pvParameters) {
             localSample.rawPressure = pressureSensor.getRawValue();
             localSample.rawVoltage = voltageSensor.getRawValue();
             localSample.rawCurrent = currentSensor.getRawValue();
-            localSample.mcuTemp = read_mcu_temp();
+            localSample.mcuTemp = mcu_temp;
 
             xRingbufferSend(telemetryRingBuf, &localSample, sizeof(TelemetrySample), 0);
         }
@@ -225,6 +226,52 @@ static void execute_command(const char* cmd) {
         set_pattern((WaveformPattern)pat, min_p, max_p, period);
         post_mode_change(MODE_PATTERN);
         printf("PATTERN_SET pat=%d min=%.1f max=%.1f period=%.1f\n", pat, min_p, max_p, period);
+    } else if (strncmp(cmd, "SET_DIAMETER ", 13) == 0) {
+        float diam = atof(cmd + 13);
+        set_target_diameter(diam);
+        printf("DIAMETER_SET %.1f cm\n", diam);
+    } else if (strcmp(cmd, "START_RIDE") == 0) {
+        post_mode_change(MODE_RIDE);
+        printf("RIDE_STARTED\n");
+    } else if (strncmp(cmd, "SET_RIDER ", 10) == 0) {
+        float weight = 70.0f, sink = 8.0f;
+        sscanf(cmd + 10, "%f %f", &weight, &sink);
+        set_ride_params(weight, sink);
+        printf("RIDE_PARAMS_SET rider=%.1f kg, sink=%.1f cm\n", weight, sink);
+    } else if (strncmp(cmd, "START_CONDITION", 15) == 0) {
+        int cycles = 4;
+        if (strlen(cmd) > 15) cycles = atoi(cmd + 16);
+        start_balloon_conditioning(cycles);
+        printf("CONDITION_STARTED cycles=%d\n", cycles);
+    } else if (strcmp(cmd, "GET_FATIGUE") == 0) {
+        FatigueState f = get_fatigue_state();
+        printf("FATIGUE,damage=%.4f,bounces=%lu,max_stress=%.1f,capacity_pct=%.1f\n",
+               f.accumulated_damage, (unsigned long)f.total_bounce_count,
+               f.max_bounce_stress_kpa, f.safe_pressure_remaining_pct);
+    } else if (strcmp(cmd, "RESET_FATIGUE") == 0) {
+        reset_fatigue_tracker();
+        printf("FATIGUE_RESET\n");
+    } else if (strncmp(cmd, "CALC_RIDE ", 10) == 0) {
+        float w = 70.0f, f = 0.5f; int t = 3;
+        sscanf(cmd + 10, "%f %d %f", &w, &t, &f);
+        RideInflationAdvice a = compute_ride_inflation(w, (BalloonType)t, f);
+        printf("RIDE_ADVICE,P_target=%.2f,P_max=%.2f,sink=%.1f,margin=%.1f%%\n",
+               a.recommended_pressure_kpa, a.max_safe_pressure_kpa,
+               a.predicted_sink_depth_cm, a.burst_safety_margin_pct);
+    } else if (strncmp(cmd, "SET_HYSTERESIS ", 15) == 0) {
+        float deadband = atof(cmd + 15);
+        set_hysteresis_band(deadband);
+        printf("HYSTERESIS_SET %.2f kPa\n", deadband);
+    } else if (strncmp(cmd, "SET_PUMP_MODEL ", 15) == 0) {
+        float dz = 35.0f, stall = 72.0f;
+        sscanf(cmd + 15, "%f %f", &dz, &stall);
+        set_pump_model_params(dz, stall);
+        printf("PUMP_MODEL_SET deadzone=%.1f stall=%.1f\n", dz, stall);
+    } else if (strncmp(cmd, "SET_SHAPE_MODEL ", 16) == 0) {
+        float neck_v = 0.05f, shape = 0.85f;
+        sscanf(cmd + 16, "%f %f", &neck_v, &shape);
+        set_balloon_shape_params(neck_v, shape);
+        printf("SHAPE_MODEL_SET neck=%.3f L shape=%.2f\n", neck_v, shape);
     } else if (strcmp(cmd, "STOP") == 0) {
         pumpMotor.emergencyStop();
         post_mode_change(MODE_IDLE);
@@ -261,14 +308,19 @@ static void execute_command(const char* cmd) {
     } else if (strcmp(cmd, "RUN_SELF_TEST") == 0 || strcmp(cmd, "SELF_TEST") == 0) {
         print_diagnostic_report();
     } else if (strcmp(cmd, "GET_DIAGNOSTICS") == 0 || strcmp(cmd, "STATUS") == 0) {
-        printf("DIAG,uptime=%lld,heap=%lu,mcu_temp=%.1f,mode=%d,samples=%lu,pop_recorded=%d\n",
+        BalloonMaterialPhysics phys = get_balloon_physics_state();
+        BounceRhythmState rhythm = get_bounce_rhythm();
+        printf("DIAG,uptime=%lld,heap=%lu,mcu_temp=%.1f,mode=%d,samples=%lu,pop_rec=%d,lambda=%.2f,stress=%.1f,impact=%d,bounces=%lu,rhythm_freq=%.2f\n",
                esp_timer_get_time() / 1000000, esp_get_free_heap_size(), read_mcu_temp(),
-               (int)currentMode, totalSamplesProcessed, is_pop_recorded() ? 1 : 0);
+               (int)currentMode, totalSamplesProcessed, is_pop_recorded() ? 1 : 0,
+               phys.stretch_ratio, phys.hyperelastic_stress_kpa, (int)phys.impact_type,
+               (unsigned long)rhythm.bounce_count, rhythm.frequency_hz);
     } else if (strcmp(cmd, "CAL_SAVE") == 0) {
         save_system_config();
         printf("CAL_SAVED\n");
     }
 }
+
 
 // WiFi SoftAP Initialization
 static void wifi_init_softap(void) {
