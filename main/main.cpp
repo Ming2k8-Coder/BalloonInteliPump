@@ -197,14 +197,14 @@ static void execute_command(const char* cmd) {
         isConnected = true;
         printf("CONNECTED\n");
     } else if (strcmp(cmd, "START_MANUAL") == 0) {
-        currentMode = MODE_MANUAL;
+        post_mode_change(MODE_MANUAL);
     } else if (strcmp(cmd, "START_SMART") == 0) {
-        currentMode = MODE_SMART;
+        post_mode_change(MODE_SMART);
     } else if (strcmp(cmd, "START_BURST") == 0) {
-        currentMode = MODE_BURST;
+        post_mode_change(MODE_BURST);
     } else if (strcmp(cmd, "STOP") == 0) {
         pumpMotor.emergencyStop();
-        currentMode = MODE_IDLE;
+        post_mode_change(MODE_IDLE);
     } else if (strcmp(cmd, "VALVE_ON") == 0) {
         write_solenoid_pwm(255);
         printf("VALVE_OPEN\n");

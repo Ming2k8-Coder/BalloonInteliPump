@@ -4,6 +4,9 @@
 #include "bip_config.h"
 #include "bip_sensors.h"
 #include "bip_motor.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
 
 enum SystemMode {
     MODE_IDLE = 0,
@@ -14,10 +17,22 @@ enum SystemMode {
     MODE_ERROR = 5
 };
 
+// FreeRTOS Event Bits for Cross-Core Synchronization
+#define BIP_EVENT_MODE_IDLE       (1 << 0)
+#define BIP_EVENT_MODE_MANUAL     (1 << 1)
+#define BIP_EVENT_MODE_SMART      (1 << 2)
+#define BIP_EVENT_MODE_BURST      (1 << 3)
+#define BIP_EVENT_MODE_ERROR      (1 << 4)
+#define BIP_EVENT_POP_TRIGGERED   (1 << 5)
+#define BIP_EVENT_EMERGENCY_STOP  (1 << 6)
+
+extern EventGroupHandle_t sysEventGroup;
 extern SystemMode currentMode;
 
 void init_states();
 void update_state_machine();
+void post_mode_change(SystemMode newMode);
+
 void set_yield_ratio(float ratio);
 void set_manual_target(float pressure);
 void set_manual_mode(bool targetMode);

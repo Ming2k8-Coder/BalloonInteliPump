@@ -7,6 +7,7 @@
 
 static const char *TAG = "BIP_STATE";
 
+EventGroupHandle_t sysEventGroup = NULL;
 SystemMode currentMode = MODE_IDLE;
 static const char* errorLine1 = "";
 static const char* errorLine2 = "";
@@ -65,8 +66,67 @@ static int postPopHoldCountdown = 0;
 static float burstPeak = 0.0f;
 static bool burstPopped = false;
 
+static void reset_buffers() {
+    memset(pressureBuf, 0, sizeof(pressureBuf));
+    memset(timeBuf, 0, sizeof(timeBuf));
+    bufIndex = 0;
+    bufFull = false;
+    current_dp_dt = 0.0f;
+    current_d2p_dt2 = 0.0f;
+    postPopHoldCountdown = 0;
+    pid_integral = 0;
+    pid_lastError = 0;
+    pid_lastTime = 0;
+}
+
+// ----------------------------------------------------
+// FREERTOS THREAD-SAFE MODE TRANSITION ENGINE
+// ----------------------------------------------------
+void post_mode_change(SystemMode newMode) {
+    if (currentMode == newMode) return;
+
+    ESP_LOGI(TAG, "Mode Transition: %d -> %d", (int)currentMode, (int)newMode);
+    currentMode = newMode;
+
+    // Clear previous event bits
+    if (sysEventGroup != NULL) {
+        xEventGroupClearBits(sysEventGroup,
+                             BIP_EVENT_MODE_IDLE | BIP_EVENT_MODE_MANUAL |
+                             BIP_EVENT_MODE_SMART | BIP_EVENT_MODE_BURST | BIP_EVENT_MODE_ERROR);
+    }
+
+    // Clean Entry Actions for new State
+    reset_buffers();
+
+    switch (newMode) {
+        case MODE_IDLE:
+            pumpMotor.setTargetPWM(0);
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_IDLE);
+            break;
+        case MODE_MANUAL:
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_MANUAL);
+            break;
+        case MODE_SMART:
+            smartState = SMART_IDLE;
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_SMART);
+            break;
+        case MODE_BURST:
+            burstPopped = false;
+            burstPeak = 0.0f;
+            safePopDataReady = false;
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_BURST);
+            break;
+        case MODE_CALIBRATION:
+            pumpMotor.setTargetPWM(0);
+            break;
+        case MODE_ERROR:
+            pumpMotor.emergencyStop();
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_ERROR);
+            break;
+    }
+}
+
 void record_pop_sample(float p, float rawV, uint8_t pwm, float currentA) {
-    // 1. Continuous Live Recording (Never Stops!)
     liveRingBuffer[liveWriteIndex].timestamp_us = (uint32_t)esp_timer_get_time();
     liveRingBuffer[liveWriteIndex].pressure = p;
     liveRingBuffer[liveWriteIndex].rawVolts = rawV;
@@ -75,15 +135,14 @@ void record_pop_sample(float p, float rawV, uint8_t pwm, float currentA) {
 
     liveWriteIndex = (liveWriteIndex + 1) % POP_BUF_SIZE;
 
-    // 2. Pop Trigger Handling
     if (postPopHoldCountdown > 0) {
         postPopHoldCountdown--;
         if (postPopHoldCountdown == 0) {
-            // Ultra-Fast memcpy (<10 microseconds execution on 240MHz CPU) into Safe RAM!
             memcpy(safePopRAMBuffer, liveRingBuffer, sizeof(liveRingBuffer));
             safePopHeadIndex = liveWriteIndex;
             safePopDataReady = true;
-            ESP_LOGI(TAG, "POP CAPTURED! Executed fast memcpy into Safe RAM (2000 full-precision samples ready).");
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_POP_TRIGGERED);
+            ESP_LOGI(TAG, "POP CAPTURED! Executed fast memcpy into Safe RAM (4000 full-precision samples ready).");
         }
     }
 }
@@ -101,7 +160,6 @@ PopBlackBoxSample get_pop_sample(int index) {
         PopBlackBoxSample empty = {};
         return empty;
     }
-    // Read from Safe Memory Buffer relative to captured head index
     int realIdx = (safePopHeadIndex + index) % POP_BUF_SIZE;
     return safePopRAMBuffer[realIdx];
 }
@@ -124,16 +182,6 @@ void dump_pop_recording() {
                i, (unsigned long)s.timestamp_us, s.pressure, s.rawVolts, s.pwm, s.current_ma);
     }
     printf("--- POP BLACK BOX DUMP END ---\n");
-}
-
-static void reset_buffers() {
-    memset(pressureBuf, 0, sizeof(pressureBuf));
-    memset(timeBuf, 0, sizeof(timeBuf));
-    bufIndex = 0;
-    bufFull = false;
-    current_dp_dt = 0.0f;
-    current_d2p_dt2 = 0.0f;
-    postPopHoldCountdown = 0;
 }
 
 static void add_sample(float p) {
@@ -193,17 +241,16 @@ float predict_local_pressure_forecast(int steps_ahead) {
 }
 
 void init_states() {
-    currentMode = MODE_IDLE;
-    burstPopped = false;
-    burstPeak = 0.0f;
-    reset_buffers();
+    if (sysEventGroup == NULL) {
+        sysEventGroup = xEventGroupCreate();
+    }
+    post_mode_change(MODE_IDLE);
 }
 
 void trigger_error(const char* e1, const char* e2) {
-    pumpMotor.emergencyStop();
     errorLine1 = e1;
     errorLine2 = e2;
-    currentMode = MODE_ERROR;
+    post_mode_change(MODE_ERROR);
     ESP_LOGE(TAG, "Error Triggered: %s - %s", e1, e2);
 }
 
@@ -326,11 +373,10 @@ static void update_burst() {
     
     pumpMotor.setTargetPWM(255);
     
-    // Pop Trigger Detection: Pressure drops > 20% from peak
     if (burstPeak > 10.0f && p < burstPeak * 0.8f && postPopHoldCountdown == 0 && !safePopDataReady) {
         pumpMotor.emergencyStop();
         burstPopped = true;
-        postPopHoldCountdown = 1000; // Capture 1000 post-pop samples then memcpy to Safe RAM
+        postPopHoldCountdown = 1000;
         ESP_LOGI(TAG, "POP DETECTED! Peak: %.2f kPa. Recording 1000 post-pop samples before safe memcpy...", burstPeak);
     }
 }
