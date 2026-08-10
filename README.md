@@ -4,9 +4,9 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Dual--Core%20Lock--Free%20RingBuffer-orange.svg)]()
 
-**Balloon Intelligent Pump (BIP)** is an industrial-grade, high-precision automated telemetry and measurement framework designed to analyze the mechanical, viscoelastic, and recreational inflation properties of latex balloons and inflatable elastomeric materials.
+**Balloon Intelligent Pump (BIP)** is an industrial-grade, high-precision automated telemetry and measurement framework designed to analyze the mechanical, viscoelastic, hyperelastic, and recreational inflation properties of latex balloons and inflatable elastomeric materials.
 
-Featuring **smart material yield detection**, **controlled destruction burst testing**, **dynamic breathing heartbeat pulses**, **rhythmic waveform generation**, **4000-sample Pop Black Box RAM recording**, **Recursive Least Squares (RLS) time-series forecasting**, and **real-time lock-free UDP telemetry**, BIP bridges the gap between pneumatic inflation hardware and scientific material characterization.
+Featuring **Mooney-Rivlin hyperelastic stress modeling**, **microsecond burst shock detection**, **smart material yield point detection**, **controlled destruction burst testing**, **dynamic breathing heartbeat pulses**, **rhythmic waveform generation**, **4000-sample Pop Black Box RAM recording**, **Recursive Least Squares (RLS) time-series forecasting**, and **real-time lock-free UDP telemetry**, BIP bridges the gap between pneumatic inflation hardware and scientific material characterization.
 
 ---
 
@@ -30,6 +30,7 @@ graph TD
             DRDY["ADS1220 2000 SPS DRDY Interrupt"] -->|vTaskNotifyGiveFromISR| Control["Control Loop & DSP Engine"]
             Kalman["1D Adaptive Kalman Filter"] --> Control
             SG["Savitzky-Golay FIR dP/dt Filter"] --> Control
+            Mooney["Mooney-Rivlin Hyperelastic Model"] --> Control
             Control --> PWM["25 kHz Ultrasonic Motor LEDC PWM"]
             Control --> Valve["20 kHz Solenoid Relief Valve"]
         end
@@ -59,7 +60,7 @@ graph TD
     classDef pc fill:#0f172a,stroke:#6366f1,stroke-width:2px,color:#f8fafc;
     classDef ring fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
 
-    class Core1,Control,DRDY,Kalman,SG,PWM,Valve core1;
+    class Core1,Control,DRDY,Kalman,SG,Mooney,PWM,Valve core1;
     class Core0,WiFi,Sockets,UART,Temp core0;
     class PC,Server,ML,Classifier,GUI pc;
     class RingBuf,PopRAM ring;
@@ -69,13 +70,15 @@ graph TD
 
 ## ⚡ Key Technical Features
 
+- **Mooney-Rivlin Hyperelastic Latex Model (`bip_balloon_physics`):** Calculates real-time latex stretch ratio ($\lambda = D/D_0$), hyperelastic strain energy ($W_{\text{Joules}}$), and material yield risk factor.
+- **Acoustic & Mechanical Burst Shock Engine:** Detects rapid pressure collapses ($dP/dt < -40\text{ kPa/s}$) to distinguish popping from venting and execute microsecond motor cutoff.
+- **Real-Time Balloon Volume & Stretch Estimator (`bip_volume_estimator`):** Continuous integration of air volume ($V_{\text{liters}}$) and estimated balloon diameter ($D_{\text{cm}}$).
 - **Microsecond Hardware DRDY Interrupt:** Synced to 2000 SPS ADS1220 24-bit SPI ADC using FreeRTOS Direct Task Notifications (`vTaskNotifyGiveFromISR`).
 - **1D Adaptive Kalman Filter:** Zero-phase-lag digital filtering for high-precision pressure readings.
 - **Savitzky-Golay 9-Point FIR Derivative Filter:** Computes 1st ($dP/dt$) and 2nd ($d^2P/dt^2$) analytical derivatives for inflection yield detection.
 - **4000-Sample Pop Black Box RAM Buffer:** 2.0-second full precision recording (1.5s pre-pop yield + 0.5s post-pop collapse) with <18µs fast `memcpy()` to safe RAM.
 - **Dynamic Breathing Heartbeat Mode (`MODE_PULSE`):** Rhythmic $0.1\text{--}2.0\text{ Hz}$ sine pulse generator for living balloon feel with automatic safety relief venting.
 - **Rhythmic Waveform Pattern Player (`MODE_PATTERN`):** Plays Sine, Stairs, Triangle, and Crescendo pressure cycles.
-- **32 KB Lock-Free RingBuffer:** Inter-core zero-copy stream from Core 1 DSP to Core 0 LwIP BSD UDP sockets.
 - **Automated Hardware Self-Test Engine:** `RUN_SELF_TEST` diagnostic verification of SPI ADC, MCU thermal sensor, and PWM drivers.
 
 ---
@@ -96,6 +99,8 @@ BalloonInteliPump/
 │   ├── bip_storage.h / .cpp    <-- NVS storage manager
 │   ├── bip_state.h / .cpp      <-- FreeRTOS Event Group state machine & waveform generators
 │   ├── bip_diagnostics.h/.cpp  <-- Automated hardware self-test engine
+│   ├── bip_volume_estimator.h/.cpp <-- Volume (L) and Diameter (cm) estimator
+│   ├── bip_balloon_physics.h/.cpp  <-- Mooney-Rivlin hyperelastic model & burst shock engine
 │   └── main.cpp                <-- FreeRTOS dual-core task runner (app_main)
 ├── test/                       <-- ESP-IDF Unity Unit Test Component
 │   ├── CMakeLists.txt
@@ -151,6 +156,7 @@ Commands are sent via line-terminated string payloads over USB Serial or UDP soc
 | `SET_PULSE <base> <amp> <freq>` | Configures pulse base pressure (kPa), amplitude, and frequency (Hz). |
 | `START_PATTERN` | Activates Rhythmic Waveform Generator. |
 | `SET_PATTERN <pat> <min> <max> <period>` | Configures pattern type (`0: Sine, 1: Stairs, 2: Triangle, 3: Crescendo`). |
+| `SET_BALLOON_TYPE <0-3>` | Selects balloon preset size (`0: 5", 1: 11", 2: 16", 3: 36"`). |
 | `STOP` | Emergency Stop. Kills PWM outputs and clears active runs. |
 | `SET_PWM <0-255>` | Sets direct pump PWM level. |
 | `SET_TARGET <kPa>` | Sets manual target pressure for PID closed-loop hold. |

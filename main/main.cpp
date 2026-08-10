@@ -21,8 +21,8 @@
 #include "bip_storage.h"
 #include "bip_state.h"
 #include "bip_diagnostics.h"
-#include "bip_webserver.h"
 #include "bip_volume_estimator.h"
+#include "bip_balloon_physics.h"
 
 static const char *TAG = "BIP_MAIN";
 
@@ -74,6 +74,7 @@ static void control_task(void *pvParameters) {
         // 4. Update PID & State Machine
         update_state_machine();
         update_volume_estimator(pressureSensor.getValue(), (float)pumpMotor.getCurrentPWM(), 0.0005f);
+        update_balloon_physics(pressureSensor.getValue(), get_local_dp_dt(), 0.0005f);
         totalSamplesProcessed++;
 
         // 5. Continuous High-Precision Pop Black Box RAM Recording (2000 SPS)
@@ -248,6 +249,10 @@ static void execute_command(const char* cmd) {
         float rate = atof(cmd + 9);
         pumpMotor.setRampRate(rate);
         printf("RAMP_SET %.2f\n", rate);
+    } else if (strncmp(cmd, "SET_BALLOON_TYPE ", 17) == 0) {
+        int btype = atoi(cmd + 17);
+        set_balloon_preset((BalloonType)std::clamp(btype, 0, 3));
+        printf("BALLOON_TYPE_SET %d\n", btype);
     } else if (strcmp(cmd, "ZERO_PRESSURE") == 0 || strcmp(cmd, "ZERO_TARE") == 0) {
         pressureSensor.tare();
         printf("PRESSURE_ZEROED\n");
@@ -311,10 +316,9 @@ extern "C" void app_main(void) {
     init_solenoid_valve();
     init_states();
 
-    // 3. Initialize WiFi, Web Server & 32KB FreeRTOS Lock-Free RingBuffer
+    // 3. Initialize WiFi, Balloon Physics & 32KB FreeRTOS Lock-Free RingBuffer
     wifi_init_softap();
-    init_volume_estimator(5.0f);
-    start_web_server();
+    init_balloon_physics(BALLOON_11INCH);
     telemetryRingBuf = xRingbufferCreate(TELEM_RING_BUF_SIZE, RINGBUF_TYPE_NOSPLIT);
 
     // 4. Spawn Dual-Core FreeRTOS Tasks with Core Affinity
