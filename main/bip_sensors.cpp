@@ -14,7 +14,6 @@ BIP_Sensor currentSensor("Current");
 static TaskHandle_t s_controlTaskHandle = NULL;
 static temperature_sensor_handle_t temp_handle = NULL;
 
-// Native ESP-IDF GPIO ISR Handler for ADS1220 DRDY pin
 static void IRAM_ATTR drdy_gpio_isr_handler(void* arg) {
     if (s_controlTaskHandle != NULL) {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -25,7 +24,7 @@ static void IRAM_ATTR drdy_gpio_isr_handler(void* arg) {
     }
 }
 
-BIP_Sensor::BIP_Sensor(const char* name) {
+BIP_Sensor::BIP_Sensor(const char* name) : _kalman(0.02f, 0.5f, 1.0f) {
     _name = name;
     _windowSize = 10;
     _histIndex = 0;
@@ -51,7 +50,8 @@ void BIP_Sensor::setRawValue(float volts) {
     }
     
     _rawVolts = _runningSum / _windowSize;
-    _currentValue = mapMultiPoint(_rawVolts);
+    float unFiltered = mapMultiPoint(_rawVolts);
+    _currentValue = _kalman.update(unFiltered);
 }
 
 float BIP_Sensor::getRawValue() {
@@ -60,6 +60,10 @@ float BIP_Sensor::getRawValue() {
 
 float BIP_Sensor::getValue() {
     return _currentValue - _zeroOffset;
+}
+
+float BIP_Sensor::getFilteredValue() {
+    return _kalman.getValue() - _zeroOffset;
 }
 
 void BIP_Sensor::tare() {
@@ -77,6 +81,7 @@ float BIP_Sensor::getZeroOffset() {
 void BIP_Sensor::resetCalibration() {
     _calData.numPoints = 0;
     _zeroOffset = 0.0f;
+    _kalman.reset(0.0f);
 }
 
 void BIP_Sensor::addCalibrationPoint(float measuredRaw, float knownReal) {
@@ -152,8 +157,8 @@ esp_err_t init_spi_ads1220(spi_device_handle_t *spi_handle) {
     }
 
     spi_device_interface_config_t devcfg = {};
-    devcfg.clock_speed_hz = 4 * 1000 * 1000; // 4 MHz SPI
-    devcfg.mode = 1;                         // CPOL=0, CPHA=1 for ADS1220
+    devcfg.clock_speed_hz = 4 * 1000 * 1000;
+    devcfg.mode = 1;
     devcfg.spics_io_num = PIN_ADS_CS;
     devcfg.queue_size = 7;
 
@@ -163,14 +168,12 @@ esp_err_t init_spi_ads1220(spi_device_handle_t *spi_handle) {
         return ret;
     }
 
-    // Configure ADS1220 Registers: 2000 SPS continuous mode
     uint8_t tx_data[5] = { 0x43, 0x81, 0xCE, 0x00, 0x00 };
     spi_transaction_t t = {};
     t.length = 8 * 5;
     t.tx_buffer = tx_data;
     spi_device_polling_transmit(*spi_handle, &t);
 
-    // Send START/SYNC
     uint8_t start_cmd = 0x08;
     t.length = 8;
     t.tx_buffer = &start_cmd;
@@ -181,7 +184,7 @@ esp_err_t init_spi_ads1220(spi_device_handle_t *spi_handle) {
 }
 
 int32_t read_ads1220_raw(spi_device_handle_t spi_handle) {
-    uint8_t tx_cmd = 0x12; // RDATA
+    uint8_t tx_cmd = 0x12;
     uint8_t rx_data[3] = {0};
 
     spi_transaction_t t = {};
@@ -205,7 +208,7 @@ esp_err_t init_drdy_isr(TaskHandle_t targetTaskHandle) {
     s_controlTaskHandle = targetTaskHandle;
 
     gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_NEGEDGE; // DRDY falling edge
+    io_conf.intr_type = GPIO_INTR_NEGEDGE;
     io_conf.pin_bit_mask = (1ULL << PIN_ADS_DRDY);
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;

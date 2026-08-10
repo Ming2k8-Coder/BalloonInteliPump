@@ -9,6 +9,36 @@
 
 #define MAX_CAL_POINTS 5
 
+// 1D Adaptive Kalman Filter for Zero-Lag Pressure Signal Filtering
+class AdaptiveKalmanFilter {
+public:
+    AdaptiveKalmanFilter(float q = 0.02f, float r = 0.5f, float p = 1.0f) {
+        _q = q; // Process noise covariance
+        _r = r; // Measurement noise covariance
+        _p = p; // Estimation error covariance
+        _x = 0.0f;
+        _k = 0.0f;
+    }
+
+    float update(float measurement) {
+        _p = _p + _q;
+        _k = _p / (_p + _r);
+        _x = _x + _k * (measurement - _x);
+        _p = (1.0f - _k) * _p;
+        return _x;
+    }
+
+    void reset(float initial_val = 0.0f) {
+        _x = initial_val;
+        _p = 1.0f;
+    }
+
+    float getValue() const { return _x; }
+
+private:
+    float _q, _r, _p, _x, _k;
+};
+
 typedef struct {
     float rawValue;  // ADC Reading or Voltage
     float realValue; // Physical Unit (kPa, V, A)
@@ -25,6 +55,7 @@ public:
     void setRawValue(float rawVolts);
     float getValue();
     float getRawValue();
+    float getFilteredValue(); // Kalman filtered value
     
     // Tare zeroing
     void tare();
@@ -51,6 +82,7 @@ private:
     float _runningSum;
     
     SensorCalibration _calData;
+    AdaptiveKalmanFilter _kalman;
 };
 
 // Global Sensor Objects
