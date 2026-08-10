@@ -21,6 +21,8 @@
 #include "bip_storage.h"
 #include "bip_state.h"
 #include "bip_diagnostics.h"
+#include "bip_webserver.h"
+#include "bip_volume_estimator.h"
 
 static const char *TAG = "BIP_MAIN";
 
@@ -71,6 +73,7 @@ static void control_task(void *pvParameters) {
 
         // 4. Update PID & State Machine
         update_state_machine();
+        update_volume_estimator(pressureSensor.getValue(), (float)pumpMotor.getCurrentPWM(), 0.0005f);
         totalSamplesProcessed++;
 
         // 5. Continuous High-Precision Pop Black Box RAM Recording (2000 SPS)
@@ -308,8 +311,10 @@ extern "C" void app_main(void) {
     init_solenoid_valve();
     init_states();
 
-    // 3. Initialize WiFi & 32KB FreeRTOS Lock-Free RingBuffer
+    // 3. Initialize WiFi, Web Server & 32KB FreeRTOS Lock-Free RingBuffer
     wifi_init_softap();
+    init_volume_estimator(5.0f);
+    start_web_server();
     telemetryRingBuf = xRingbufferCreate(TELEM_RING_BUF_SIZE, RINGBUF_TYPE_NOSPLIT);
 
     // 4. Spawn Dual-Core FreeRTOS Tasks with Core Affinity
