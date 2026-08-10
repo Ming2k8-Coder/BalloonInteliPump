@@ -4,6 +4,8 @@
 #include "bip_config.h"
 #include "driver/spi_master.h"
 #include "esp_adc/adc_oneshot.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define MAX_CAL_POINTS 5
 
@@ -59,7 +61,10 @@ extern BIP_Sensor currentSensor;
 // Driver Functions
 esp_err_t init_spi_ads1220(spi_device_handle_t *spi_handle);
 int32_t read_ads1220_raw(spi_device_handle_t spi_handle);
+esp_err_t init_drdy_isr(TaskHandle_t targetTaskHandle);
 esp_err_t init_internal_adc(adc_oneshot_unit_handle_t *adc_handle);
 void update_adc_sensors(adc_oneshot_unit_handle_t adc_handle);
+esp_err_t init_mcu_temp_sensor();
+float read_mcu_temp();
 
 #endif // BIP_SENSORS_H

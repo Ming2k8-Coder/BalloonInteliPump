@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/ringbuf.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -22,46 +23,47 @@
 
 static const char *TAG = "BIP_MAIN";
 
-// Double Buffer Structure for Lock-Free Queue Passing
-static TelemetrySample bufferA[TELEM_BUFFER_SIZE];
-static TelemetrySample bufferB[TELEM_BUFFER_SIZE];
-static volatile int writeIndex = 0;
-static volatile bool useBufferA = true;
-
-static QueueHandle_t telemetryQueue = NULL;
+// FreeRTOS Lock-Free RingBuffer for Core 1 -> Core 0 Telemetry Passing
+static RingbufHandle_t telemetryRingBuf = NULL;
 static spi_device_handle_t ads1220_spi_handle = NULL;
 static adc_oneshot_unit_handle_t adc_handle = NULL;
+static TaskHandle_t s_controlTaskHandle = NULL;
 
 static bool isConnected = false;
 static bool wifiConnected = false;
 static uint32_t totalSamplesProcessed = 0;
 
-// Forward Declarations
 static void execute_command(const char* cmd);
 
 // ==========================================
-// 1. FREERTOS CORE 1 TASK: CONTROL & SENSING (2000 Hz)
+// 1. FREERTOS CORE 1 TASK: CONTROL & SENSING (Hardware ISR Synchronized)
 // ==========================================
 static void control_task(void *pvParameters) {
     ESP_LOGI(TAG, "Control Task running on Core %d (Priority %d)", xPortGetCoreID(), uxTaskPriorityGet(NULL));
     
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(1); // 1000 Hz base loop
+    // Install DRDY GPIO Interrupt targeting this Task Handle for microsecond notification
+    s_controlTaskHandle = xTaskGetCurrentTaskHandle();
+    init_drdy_isr(s_controlTaskHandle);
+
+    TelemetrySample localSample;
 
     while (1) {
-        // 1. Read ADS1220 Pressure Sensor
+        // Wait for Hardware ADS1220 DRDY Falling Edge Interrupt Notification (or timeout fallback)
+        uint32_t ulNotificationValue = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+        
+        // 1. Read ADS1220 Pressure Sensor (High Speed 2000 SPS)
         if (ads1220_spi_handle != NULL) {
             int32_t raw_p = read_ads1220_raw(ads1220_spi_handle);
             float press_volts = (float)raw_p * (5.0f / 8388607.0f);
             pressureSensor.setRawValue(press_volts);
         }
 
-        // 2. Read Voltage and Current ADCs
+        // 2. Read Voltage & Current ADCs
         if (adc_handle != NULL) {
             update_adc_sensors(adc_handle);
         }
 
-        // 3. Safety Check & Motors
+        // 3. Safety Check & Motor Update
         pumpMotor.update(currentSensor.getValue(), voltageSensor.getValue(), 12.0f);
         if (pumpMotor.isSafetyTriggered() && currentMode != MODE_ERROR) {
             trigger_error("MOTOR SAFETY", pumpMotor.getSafetyError());
@@ -71,34 +73,26 @@ static void control_task(void *pvParameters) {
         update_state_machine();
         totalSamplesProcessed++;
 
-        // 5. Fill Double Buffer & Notify Telemetry Queue
-        if (isConnected) {
-            TelemetrySample* activeBuffer = useBufferA ? bufferA : bufferB;
-            activeBuffer[writeIndex].timestamp = (double)esp_timer_get_time() / 1000.0;
-            activeBuffer[writeIndex].pressure = pressureSensor.getValue();
-            activeBuffer[writeIndex].pwm = pumpMotor.getCurrentPWM();
-            activeBuffer[writeIndex].voltage = voltageSensor.getValue();
-            activeBuffer[writeIndex].current = currentSensor.getValue();
-            activeBuffer[writeIndex].mode = (uint8_t)currentMode;
-            activeBuffer[writeIndex].rawPressure = pressureSensor.getRawValue();
-            activeBuffer[writeIndex].rawVoltage = voltageSensor.getRawValue();
-            activeBuffer[writeIndex].rawCurrent = currentSensor.getRawValue();
+        // 5. Zero-Copy Push to Lock-Free FreeRTOS RingBuffer for Core 0 Transmission
+        if (isConnected && telemetryRingBuf != NULL) {
+            localSample.timestamp = (double)esp_timer_get_time() / 1000.0;
+            localSample.pressure = pressureSensor.getValue();
+            localSample.pwm = pumpMotor.getCurrentPWM();
+            localSample.voltage = voltageSensor.getValue();
+            localSample.current = currentSensor.getValue();
+            localSample.mode = (uint8_t)currentMode;
+            localSample.rawPressure = pressureSensor.getRawValue();
+            localSample.rawVoltage = voltageSensor.getRawValue();
+            localSample.rawCurrent = currentSensor.getRawValue();
+            localSample.mcuTemp = read_mcu_temp();
 
-            writeIndex++;
-            if (writeIndex >= TELEM_BUFFER_SIZE) {
-                int bufferId = useBufferA ? 0 : 1;
-                useBufferA = !useBufferA;
-                writeIndex = 0;
-                xQueueSend(telemetryQueue, &bufferId, 0); // Send buffer ID to Network Task
-            }
+            xRingbufferSend(telemetryRingBuf, &localSample, sizeof(TelemetrySample), 0);
         }
-
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 // ==========================================
-// 2. FREERTOS CORE 0 TASK: NETWORKING & COMMANDS
+// 2. FREERTOS CORE 0 TASK: NETWORKING & BSD UDP SOCKETS
 // ==========================================
 static void net_telemetry_task(void *pvParameters) {
     ESP_LOGI(TAG, "Network Telemetry Task running on Core %d", xPortGetCoreID());
@@ -118,36 +112,41 @@ static void net_telemetry_task(void *pvParameters) {
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons(UDP_PORT);
 
-    int bufferId;
     char packetBuffer[1500];
+    int offset = 0;
+    int sampleBatchCount = 0;
 
     while (1) {
-        if (xQueueReceive(telemetryQueue, &bufferId, pdMS_TO_TICKS(50)) == pdTRUE) {
+        size_t item_size = 0;
+        TelemetrySample *sample = (TelemetrySample *)xRingbufferReceive(telemetryRingBuf, &item_size, pdMS_TO_TICKS(50));
+        
+        if (sample != NULL && item_size == sizeof(TelemetrySample)) {
             if (wifiConnected && isConnected) {
-                TelemetrySample* sendBuffer = (bufferId == 0) ? bufferA : bufferB;
-                int offset = 0;
-                packetBuffer[0] = '\0';
+                char payload[128];
+                snprintf(payload, sizeof(payload), "BIP,%.3f,%.2f,%d,%.2f,%.2f,%d,%.2f,%.2f,%.2f",
+                         sample->timestamp, sample->pressure, sample->pwm,
+                         sample->voltage, sample->current, sample->mode,
+                         sample->rawPressure, sample->rawVoltage, sample->rawCurrent);
 
-                for (int k = 0; k < TELEM_BUFFER_SIZE; k++) {
-                    char payload[128];
-                    snprintf(payload, sizeof(payload), "BIP,%.3f,%.2f,%d,%.2f,%.2f,%d,%.2f,%.2f,%.2f",
-                             sendBuffer[k].timestamp, sendBuffer[k].pressure, sendBuffer[k].pwm,
-                             sendBuffer[k].voltage, sendBuffer[k].current, sendBuffer[k].mode,
-                             sendBuffer[k].rawPressure, sendBuffer[k].rawVoltage, sendBuffer[k].rawCurrent);
+                uint8_t checksum = 0;
+                for (char* p = payload; *p; p++) checksum ^= (uint8_t)*p;
 
-                    uint8_t checksum = 0;
-                    for (char* p = payload; *p; p++) checksum ^= (uint8_t)*p;
-
-                    char line[160];
-                    int line_len = snprintf(line, sizeof(line), "$%s*%02X\n", payload, checksum);
-                    if (offset + line_len < sizeof(packetBuffer) - 1) {
-                        strcpy(packetBuffer + offset, line);
-                        offset += line_len;
-                    }
+                char line[160];
+                int line_len = snprintf(line, sizeof(line), "$%s*%02X\n", payload, checksum);
+                
+                if (offset + line_len < sizeof(packetBuffer) - 1) {
+                    strcpy(packetBuffer + offset, line);
+                    offset += line_len;
+                    sampleBatchCount++;
                 }
 
-                sendto(sock, packetBuffer, offset, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+                if (sampleBatchCount >= TELEM_BUFFER_SIZE) {
+                    sendto(sock, packetBuffer, offset, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+                    offset = 0;
+                    sampleBatchCount = 0;
+                }
             }
+            vRingbufferReturnItem(telemetryRingBuf, (void *)sample);
         }
     }
 }
@@ -228,8 +227,8 @@ static void execute_command(const char* cmd) {
         pressureSensor.tare();
         printf("PRESSURE_ZEROED\n");
     } else if (strcmp(cmd, "GET_DIAGNOSTICS") == 0 || strcmp(cmd, "STATUS") == 0) {
-        printf("DIAG,uptime=%lld,heap=%lu,rssi=0,mode=%d,samples=%lu\n",
-               esp_timer_get_time() / 1000000, esp_get_free_heap_size(), (int)currentMode, totalSamplesProcessed);
+        printf("DIAG,uptime=%lld,heap=%lu,mcu_temp=%.1f,mode=%d,samples=%lu\n",
+               esp_timer_get_time() / 1000000, esp_get_free_heap_size(), read_mcu_temp(), (int)currentMode, totalSamplesProcessed);
     } else if (strcmp(cmd, "CAL_SAVE") == 0) {
         save_system_config();
         printf("CAL_SAVED\n");
@@ -277,18 +276,19 @@ extern "C" void app_main(void) {
     // 2. Initialize Hardware Drivers
     init_spi_ads1220(&ads1220_spi_handle);
     init_internal_adc(&adc_handle);
+    init_mcu_temp_sensor();
     pumpMotor.begin();
     init_solenoid_valve();
     init_states();
 
-    // 3. Initialize WiFi & FreeRTOS Telemetry Queue
+    // 3. Initialize WiFi & 32KB FreeRTOS Lock-Free RingBuffer
     wifi_init_softap();
-    telemetryQueue = xQueueCreate(5, sizeof(int));
+    telemetryRingBuf = xRingbufferCreate(TELEM_RING_BUF_SIZE, RINGBUF_TYPE_NOSPLIT);
 
-    // 4. Spawn Dual-Core FreeRTOS Tasks
-    xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, 10, NULL, 1);
-    xTaskCreatePinnedToCore(net_telemetry_task, "net_task", 4096, NULL, 5, NULL, 0);
+    // 4. Spawn Dual-Core FreeRTOS Tasks with Core Affinity
+    xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, CONTROL_TASK_PRIO, NULL, CONTROL_TASK_CORE);
+    xTaskCreatePinnedToCore(net_telemetry_task, "net_task", 4096, NULL, NET_TASK_PRIO, NULL, NET_TASK_CORE);
     xTaskCreatePinnedToCore(uart_cmd_task, "uart_task", 3072, NULL, 4, NULL, 0);
 
-    ESP_LOGI(TAG, "All ESP-IDF tasks successfully initialized and running!");
+    ESP_LOGI(TAG, "All Advanced ESP-IDF Native tasks initialized and running!");
 }
