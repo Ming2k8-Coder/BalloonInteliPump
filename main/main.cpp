@@ -320,11 +320,14 @@ static void execute_command(const char* cmd) {
                vol.diameter_cm, vol.volume_liters, phys.stretch_ratio, phys.hyperelastic_stress_kpa,
                mat.estimated_C10, mat.estimated_C01, (int)phys.impact_type,
                (unsigned long)rhythm.bounce_count, fat.accumulated_damage, rhythm.frequency_hz);
+    } else if (strcmp(cmd, "GET_LOGS") == 0 || strcmp(cmd, "DUMP_LOGS") == 0) {
+        print_system_logs_json();
     } else if (strcmp(cmd, "CAL_SAVE") == 0) {
         save_system_config();
         printf("CAL_SAVED\n");
     }
 }
+
 
 
 

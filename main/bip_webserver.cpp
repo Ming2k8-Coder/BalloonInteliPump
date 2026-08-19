@@ -181,6 +181,14 @@ static esp_err_t cmd_post_handler(httpd_req_t *req) {
     return ESP_FAIL;
 }
 
+#include "bip_diagnostics.h"
+
+static esp_err_t logs_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"msg\":\"Use UART command GET_LOGS for full json stream\"}");
+    return ESP_OK;
+}
+
 esp_err_t start_bip_webserver(void) {
     if (server_handle != NULL) return ESP_OK;
 
@@ -197,11 +205,13 @@ esp_err_t start_bip_webserver(void) {
     httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
     httpd_uri_t status_uri = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler, .user_ctx = NULL };
     httpd_uri_t stream_uri = { .uri = "/api/stream", .method = HTTP_GET, .handler = stream_get_handler, .user_ctx = NULL };
+    httpd_uri_t logs_uri = { .uri = "/api/logs", .method = HTTP_GET, .handler = logs_get_handler, .user_ctx = NULL };
     httpd_uri_t cmd_uri = { .uri = "/api/cmd", .method = HTTP_POST, .handler = cmd_post_handler, .user_ctx = NULL };
 
     httpd_register_uri_handler(server_handle, &root_uri);
     httpd_register_uri_handler(server_handle, &status_uri);
     httpd_register_uri_handler(server_handle, &stream_uri);
+    httpd_register_uri_handler(server_handle, &logs_uri);
     httpd_register_uri_handler(server_handle, &cmd_uri);
 
     ESP_LOGI(TAG, "Native ESP-IDF WebServer & REST API started on port 80!");
@@ -219,4 +229,5 @@ void stop_bip_webserver(void) {
 bool is_webserver_running(void) {
     return (server_handle != NULL);
 }
+
 

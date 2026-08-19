@@ -36,6 +36,43 @@ DiagnosticReport run_system_self_test() {
     return report;
 }
 
+#include <stdarg.h>
+
+#define MAX_SYSTEM_LOGS 32
+static SystemLogEntry log_ring_buffer[MAX_SYSTEM_LOGS];
+static int log_write_idx = 0;
+static int log_total_count = 0;
+
+void log_system_event(uint8_t severity, const char* fmt, ...) {
+    SystemLogEntry *entry = &log_ring_buffer[log_write_idx];
+    entry->timestamp_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    entry->severity = severity;
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(entry->event, sizeof(entry->event), fmt, args);
+    va_end(args);
+
+    log_write_idx = (log_write_idx + 1) % MAX_SYSTEM_LOGS;
+    if (log_total_count < MAX_SYSTEM_LOGS) log_total_count++;
+
+    ESP_LOGI(TAG, "EVENT_LOG [%u]: %s", severity, entry->event);
+}
+
+void print_system_logs_json() {
+    printf("{\"logs\":[");
+    int count = (log_total_count < MAX_SYSTEM_LOGS) ? log_total_count : MAX_SYSTEM_LOGS;
+    int start_idx = (log_total_count < MAX_SYSTEM_LOGS) ? 0 : log_write_idx;
+
+    for (int i = 0; i < count; i++) {
+        int idx = (start_idx + i) % MAX_SYSTEM_LOGS;
+        SystemLogEntry *e = &log_ring_buffer[idx];
+        printf("{\"time_s\":%lu,\"sev\":%u,\"msg\":\"%s\"}%s",
+               (unsigned long)e->timestamp_s, e->severity, e->event, (i == count - 1) ? "" : ",");
+    }
+    printf("]}\n");
+}
+
 void print_diagnostic_report() {
     DiagnosticReport r = run_system_self_test();
     printf("--- HARDWARE DIAGNOSTIC REPORT ---\n");
@@ -48,3 +85,4 @@ void print_diagnostic_report() {
     printf("SYSTEM_STATUS: HEALTHY\n");
     printf("----------------------------------\n");
 }
+

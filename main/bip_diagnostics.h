@@ -16,7 +16,18 @@ typedef struct {
     uint32_t lifetime_pops;
 } DiagnosticReport;
 
+typedef struct {
+    uint32_t timestamp_s;
+    char event[64];
+    uint8_t severity; // 0=INFO, 1=WARN, 2=ERROR
+} SystemLogEntry;
+
+
 DiagnosticReport run_system_self_test();
 void print_diagnostic_report();
 
+void log_system_event(uint8_t severity, const char* fmt, ...);
+void print_system_logs_json();
+
 #endif // BIP_DIAGNOSTICS_H
+
