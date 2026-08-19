@@ -13,11 +13,15 @@ typedef struct {
     SensorCalibration currentCal;
     SafetySettings motorSafety;
     float learnedBurstThreshold;
+    uint32_t writeCount;
+    uint32_t crc32;
 } SystemConfig;
 
 esp_err_t init_storage();
 esp_err_t save_system_config();
 esp_err_t load_system_config();
+uint32_t get_nvs_write_count();
 
 #endif // BIP_STORAGE_H
+
 

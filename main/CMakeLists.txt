@@ -7,6 +7,8 @@ idf_component_register(
          "bip_diagnostics.cpp"
          "bip_volume_estimator.cpp"
          "bip_balloon_physics.cpp"
+         "bip_webserver.cpp"
     INCLUDE_DIRS "."
-    REQUIRES driver nvs_flash esp_wifi lwip esp_timer esp_adc log
+    REQUIRES driver nvs_flash esp_wifi lwip esp_timer esp_adc log esp_http_server
 )
+

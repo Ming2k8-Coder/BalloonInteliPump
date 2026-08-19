@@ -328,6 +328,8 @@ static void execute_command(const char* cmd) {
 
 
 
+#include "bip_webserver.h"
+
 // WiFi SoftAP Initialization
 static void wifi_init_softap(void) {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -355,6 +357,9 @@ static void wifi_init_softap(void) {
 
     wifiConnected = true;
     ESP_LOGI(TAG, "WiFi SoftAP initialized. SSID:%s Password:%s", WIFI_SSID, WIFI_PASSWORD);
+
+    // Start Native ESP-IDF WebServer & REST API
+    start_bip_webserver();
 }
 
 // ==========================================
@@ -386,3 +391,4 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "All Advanced ESP-IDF Native tasks initialized and running!");
 }
+
