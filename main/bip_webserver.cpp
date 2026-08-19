@@ -85,21 +85,26 @@ function sendCmd(cmd){
   fetch('/api/cmd?c='+encodeURIComponent(cmd),{method:'POST'})
   .then(r=>r.text()).then(t=>{if(t.includes('RIDE_ADVICE'))document.getElementById('calcRes').innerText=t;});
 }
-setInterval(()=>{
-  fetch('/api/status').then(r=>r.json()).then(d=>{
-    document.getElementById('press').innerHTML=d.pressure_kpa.toFixed(2)+' <span style="font-size:1rem;">kPa</span>';
-    document.getElementById('lambda').innerText=d.lambda.toFixed(2);
-    document.getElementById('stress').innerText=d.stress_kpa.toFixed(1);
-    document.getElementById('diam').innerHTML=d.diameter_cm.toFixed(1)+' <span style="font-size:1rem;">cm</span>';
-    document.getElementById('vol').innerText=d.vol_l.toFixed(3);
-    document.getElementById('pwm').innerHTML=d.pwm+' <span style="font-size:1rem;">PWM</span>';
-    document.getElementById('bounces').innerText=d.bounces;
-    document.getElementById('freq').innerText=d.rhythm_hz.toFixed(2);
-    document.getElementById('damage').innerText=(d.damage*100).toFixed(1)+'%';
-    const imp=['NONE','BOUNCE','BURST','SQUEEZE'];
-    document.getElementById('impact').innerText=imp[d.impact]||'NONE';
-  }).catch(e=>{});
-},200);
+function updateUI(d){
+  document.getElementById('press').innerHTML=d.pressure_kpa.toFixed(2)+' <span style="font-size:1rem;">kPa</span>';
+  document.getElementById('lambda').innerText=d.lambda.toFixed(2);
+  document.getElementById('stress').innerText=d.stress_kpa.toFixed(1);
+  document.getElementById('diam').innerHTML=d.diameter_cm.toFixed(1)+' <span style="font-size:1rem;">cm</span>';
+  document.getElementById('vol').innerText=d.vol_l.toFixed(3);
+  document.getElementById('pwm').innerHTML=d.pwm+' <span style="font-size:1rem;">PWM</span>';
+  document.getElementById('bounces').innerText=d.bounces;
+  document.getElementById('freq').innerText=d.rhythm_hz.toFixed(2);
+  document.getElementById('damage').innerText=(d.damage*100).toFixed(1)+'%';
+  const imp=['NONE','BOUNCE','BURST','SQUEEZE'];
+  document.getElementById('impact').innerText=imp[d.impact]||'NONE';
+}
+if(window.EventSource){
+  const evs=new EventSource('/api/stream');
+  evs.onmessage=function(e){updateUI(JSON.parse(e.data));};
+  evs.onerror=function(){setInterval(()=>{fetch('/api/status').then(r=>r.json()).then(d=>updateUI(d)).catch(e=>{});},250);};
+}else{
+  setInterval(()=>{fetch('/api/status').then(r=>r.json()).then(d=>updateUI(d)).catch(e=>{});},250);
+}
 </script>
 </body>
 </html>
@@ -128,6 +133,35 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t stream_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+
+    for (int count = 0; count < 600; count++) { // Stream for up to 30 seconds per connection
+        BalloonMaterialPhysics phys = get_balloon_physics_state();
+        OnlineMaterialParams mat = get_online_material_params();
+        BounceRhythmState rhythm = get_bounce_rhythm();
+        FatigueState fat = get_fatigue_state();
+        BalloonPhysicsEstimate vol = get_balloon_physics_estimate();
+
+        char sse_chunk[450];
+        int len = snprintf(sse_chunk, sizeof(sse_chunk),
+                  "data: {\"uptime_s\":%lld,\"heap\":%lu,\"mcu_temp\":%.1f,\"mode\":%d,\"pressure_kpa\":%.2f,\"pwm\":%d,\"diameter_cm\":%.2f,\"vol_l\":%.3f,\"lambda\":%.2f,\"stress_kpa\":%.1f,\"c10\":%.1f,\"c01\":%.1f,\"impact\":%d,\"bounces\":%lu,\"damage\":%.4f,\"rhythm_hz\":%.2f}\n\n",
+                  esp_timer_get_time() / 1000000, (unsigned long)esp_get_free_heap_size(), read_mcu_temp(),
+                  (int)currentMode, pressureSensor.getValue(), pumpMotor.getCurrentPWM(),
+                  vol.diameter_cm, vol.volume_liters, phys.stretch_ratio, phys.hyperelastic_stress_kpa,
+                  mat.estimated_C10, mat.estimated_C01, (int)phys.impact_type,
+                  (unsigned long)rhythm.bounce_count, fat.accumulated_damage, rhythm.frequency_hz);
+
+        esp_err_t res = httpd_resp_send_chunk(req, sse_chunk, len);
+        if (res != ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
 }
 
 extern void execute_command(const char* cmd);
@@ -162,10 +196,12 @@ esp_err_t start_bip_webserver(void) {
 
     httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
     httpd_uri_t status_uri = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler, .user_ctx = NULL };
+    httpd_uri_t stream_uri = { .uri = "/api/stream", .method = HTTP_GET, .handler = stream_get_handler, .user_ctx = NULL };
     httpd_uri_t cmd_uri = { .uri = "/api/cmd", .method = HTTP_POST, .handler = cmd_post_handler, .user_ctx = NULL };
 
     httpd_register_uri_handler(server_handle, &root_uri);
     httpd_register_uri_handler(server_handle, &status_uri);
+    httpd_register_uri_handler(server_handle, &stream_uri);
     httpd_register_uri_handler(server_handle, &cmd_uri);
 
     ESP_LOGI(TAG, "Native ESP-IDF WebServer & REST API started on port 80!");
@@ -183,3 +219,4 @@ void stop_bip_webserver(void) {
 bool is_webserver_running(void) {
     return (server_handle != NULL);
 }
+

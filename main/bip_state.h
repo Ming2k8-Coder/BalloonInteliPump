@@ -96,6 +96,11 @@ void dump_pop_recording();
 // Minimum-Jerk S-Curve Profile Generator
 float update_scurve_profile(float current_val, float target_val, float max_vel, float dt_sec);
 
+// Coordinated Actuator Dynamic Damping Engine & Chirp Alarm
+void set_dynamic_damping(float kv_p, float kv_d);
+void trigger_pneumatic_chirp_warning();
+
 #endif // BIP_STATE_H
+
 
 

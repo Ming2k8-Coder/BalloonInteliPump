@@ -783,6 +783,23 @@ void update_state_machine() {
     }
 }
 
+static float kv_p_damping = 8.0f;
+static float kv_d_damping = 1.5f;
+
+void set_dynamic_damping(float kv_p, float kv_d) {
+    kv_p_damping = std::clamp(kv_p, 0.0f, 30.0f);
+    kv_d_damping = std::clamp(kv_d, 0.0f, 10.0f);
+}
+
+void trigger_pneumatic_chirp_warning() {
+    for (int i = 0; i < 6; i++) {
+        write_solenoid_pwm(220);
+        vTaskDelay(pdMS_TO_TICKS(25));
+        write_solenoid_pwm(0);
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
 float update_scurve_profile(float current_val, float target_val, float max_vel, float dt_sec) {
     if (dt_sec <= 0.0f) return target_val;
     float error = target_val - current_val;
@@ -790,5 +807,6 @@ float update_scurve_profile(float current_val, float target_val, float max_vel, 
     if (std::abs(error) <= step) return target_val;
     return current_val + ((error > 0.0f) ? step : -step);
 }
+
 
 
