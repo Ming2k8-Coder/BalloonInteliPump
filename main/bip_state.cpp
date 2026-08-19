@@ -783,3 +783,12 @@ void update_state_machine() {
     }
 }
 
+float update_scurve_profile(float current_val, float target_val, float max_vel, float dt_sec) {
+    if (dt_sec <= 0.0f) return target_val;
+    float error = target_val - current_val;
+    float step = max_vel * dt_sec;
+    if (std::abs(error) <= step) return target_val;
+    return current_val + ((error > 0.0f) ? step : -step);
+}
+
+

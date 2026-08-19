@@ -58,6 +58,18 @@ void test_ride_inflation_calculator(void) {
     TEST_ASSERT_TRUE(advice.predicted_sink_depth_cm > 0.0f);
 }
 
+void test_scurve_profile_generator(void) {
+    float curr = 10.0f;
+    float target = 30.0f;
+    float max_vel = 5.0f; // 5 units/sec
+
+    float next1 = update_scurve_profile(curr, target, max_vel, 1.0f);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 15.0f, next1);
+
+    float next2 = update_scurve_profile(29.0f, target, max_vel, 1.0f);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 30.0f, next2);
+}
+
 void run_state_tests(void) {
     RUN_TEST(test_pid_parameter_tuning);
     RUN_TEST(test_yield_ratio_constraints);
@@ -65,5 +77,7 @@ void run_state_tests(void) {
     RUN_TEST(test_new_modes_transitions);
     RUN_TEST(test_physics_fatigue_and_impact_classification);
     RUN_TEST(test_ride_inflation_calculator);
+    RUN_TEST(test_scurve_profile_generator);
 }
+
 

@@ -307,19 +307,25 @@ static void execute_command(const char* cmd) {
         dump_pop_recording();
     } else if (strcmp(cmd, "RUN_SELF_TEST") == 0 || strcmp(cmd, "SELF_TEST") == 0) {
         print_diagnostic_report();
-    } else if (strcmp(cmd, "GET_DIAGNOSTICS") == 0 || strcmp(cmd, "STATUS") == 0) {
+    } else if (strcmp(cmd, "GET_JSON_STATUS") == 0 || strcmp(cmd, "JSON_STATUS") == 0) {
         BalloonMaterialPhysics phys = get_balloon_physics_state();
+        OnlineMaterialParams mat = get_online_material_params();
         BounceRhythmState rhythm = get_bounce_rhythm();
-        printf("DIAG,uptime=%lld,heap=%lu,mcu_temp=%.1f,mode=%d,samples=%lu,pop_rec=%d,lambda=%.2f,stress=%.1f,impact=%d,bounces=%lu,rhythm_freq=%.2f\n",
+        FatigueState fat = get_fatigue_state();
+        BalloonPhysicsEstimate vol = get_balloon_physics_estimate();
+
+        printf("{\"uptime_s\":%lld,\"heap\":%lu,\"mcu_temp\":%.1f,\"mode\":%d,\"pressure_kpa\":%.2f,\"pwm\":%d,\"diameter_cm\":%.2f,\"vol_l\":%.3f,\"lambda\":%.2f,\"stress_kpa\":%.1f,\"c10\":%.1f,\"c01\":%.1f,\"impact\":%d,\"bounces\":%lu,\"damage\":%.4f,\"rhythm_hz\":%.2f}\n",
                esp_timer_get_time() / 1000000, esp_get_free_heap_size(), read_mcu_temp(),
-               (int)currentMode, totalSamplesProcessed, is_pop_recorded() ? 1 : 0,
-               phys.stretch_ratio, phys.hyperelastic_stress_kpa, (int)phys.impact_type,
-               (unsigned long)rhythm.bounce_count, rhythm.frequency_hz);
+               (int)currentMode, pressureSensor.getValue(), pumpMotor.getCurrentPWM(),
+               vol.diameter_cm, vol.volume_liters, phys.stretch_ratio, phys.hyperelastic_stress_kpa,
+               mat.estimated_C10, mat.estimated_C01, (int)phys.impact_type,
+               (unsigned long)rhythm.bounce_count, fat.accumulated_damage, rhythm.frequency_hz);
     } else if (strcmp(cmd, "CAL_SAVE") == 0) {
         save_system_config();
         printf("CAL_SAVED\n");
     }
 }
+
 
 
 // WiFi SoftAP Initialization

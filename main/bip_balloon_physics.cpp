@@ -142,6 +142,67 @@ void update_balloon_physics(float pressure_kpa, float dp_dt, float dt_sec) {
     update_balloon_physics_ext(pressure_kpa, dp_dt, 0.0f, 30.0f, dt_sec);
 }
 
+// Online Mooney-Rivlin Parameter Identification RLS State
+static OnlineMaterialParams onlineParams = { .estimated_C10 = 180.0f, .estimated_C01 = 20.0f, .r_squared = 0.0f, .converged = false };
+static float rls_sum_x = 0.0f, rls_sum_y = 0.0f, rls_sum_xy = 0.0f, rls_sum_xx = 0.0f;
+static int rls_sample_count = 0;
+
+// Micro-Flutter Tear Precursor Detector State
+static float flutter_window[16] = {0};
+static int flutter_idx = 0;
+static float current_flutter_variance = 0.0f;
+static bool tear_precursor_detected = false;
+
+void update_online_material_identification(float pressure_kpa, float stretch_ratio) {
+    if (stretch_ratio <= 1.05f || pressure_kpa <= 2.0f) return;
+
+    float lambda = stretch_ratio;
+    float lambda_sq = lambda * lambda;
+    float inv_lambda = 1.0f / lambda;
+    float denom = 2.0f * (lambda_sq - inv_lambda);
+    if (denom <= 0.001f) return;
+
+    // Linear regression y = C10 + C01 * x, where y = sigma / denom, x = 1/lambda
+    float y = pressure_kpa / denom;
+    float x = inv_lambda;
+
+    // Online Exponential Forgetting Factor (gamma = 0.995)
+    const float gamma = 0.995f;
+    rls_sum_x  = gamma * rls_sum_x + x;
+    rls_sum_y  = gamma * rls_sum_y + y;
+    rls_sum_xy = gamma * rls_sum_xy + (x * y);
+    rls_sum_xx = gamma * rls_sum_xx + (x * x);
+    rls_sample_count++;
+
+    if (rls_sample_count >= 50) {
+        float n = (float)rls_sample_count;
+        float denominator = (n * rls_sum_xx - rls_sum_x * rls_sum_x);
+        if (std::abs(denominator) > 1e-5f) {
+            float slope_C01 = (n * rls_sum_xy - rls_sum_x * rls_sum_y) / denominator;
+            float intercept_C10 = (rls_sum_y - slope_C01 * rls_sum_x) / n;
+
+            if (intercept_C10 > 50.0f && intercept_C10 < 400.0f && slope_C01 >= 0.0f && slope_C01 < 100.0f) {
+                onlineParams.estimated_C10 = 0.95f * onlineParams.estimated_C10 + 0.05f * intercept_C10;
+                onlineParams.estimated_C01 = 0.95f * onlineParams.estimated_C01 + 0.05f * slope_C01;
+                onlineParams.converged = true;
+                onlineParams.r_squared = std::clamp((rls_sum_xy * rls_sum_xy) / (rls_sum_xx * (rls_sum_y * rls_sum_y / n + 1e-4f)), 0.0f, 1.0f);
+            }
+        }
+    }
+}
+
+OnlineMaterialParams get_online_material_params() {
+    return onlineParams;
+}
+
+bool is_tear_precursor_flutter_detected() {
+    return tear_precursor_detected;
+}
+
+float get_flutter_variance() {
+    return current_flutter_variance;
+}
+
 void update_balloon_physics_ext(float pressure_kpa, float dp_dt, float d2p_dt2, float mcu_temp_c, float dt_sec) {
     if (dt_sec <= 0.0f) dt_sec = 0.0005f;
 
@@ -157,8 +218,28 @@ void update_balloon_physics_ext(float pressure_kpa, float dp_dt, float d2p_dt2, 
     float delta_T = ambient_est_c - 25.0f;
     float thermal_softening = std::clamp(1.0f - 0.005f * delta_T, 0.65f, 1.05f);
 
-    float effective_C10 = BASE_C10 * thermal_softening;
-    float effective_C01 = BASE_C01 * thermal_softening;
+    // Online Material Estimation Update & Mooney-Rivlin Wall Stress
+    update_online_material_identification(pressure_kpa, lambda);
+    float active_C10 = onlineParams.converged ? onlineParams.estimated_C10 : BASE_C10;
+    float active_C01 = onlineParams.converged ? onlineParams.estimated_C01 : BASE_C01;
+
+    float effective_C10 = active_C10 * thermal_softening;
+    float effective_C01 = active_C01 * thermal_softening;
+
+    // High-Frequency Micro-Flutter Tear Precursor Detection
+    flutter_window[flutter_idx] = dp_dt;
+    flutter_idx = (flutter_idx + 1) % 16;
+    float mean_flutter = 0.0f;
+    for (int i = 0; i < 16; i++) mean_flutter += flutter_window[i];
+    mean_flutter /= 16.0f;
+
+    float var_sum = 0.0f;
+    for (int i = 0; i < 16; i++) {
+        float diff = flutter_window[i] - mean_flutter;
+        var_sum += diff * diff;
+    }
+    current_flutter_variance = var_sum / 16.0f;
+    tear_precursor_detected = (pressure_kpa > 15.0f && current_flutter_variance > 120.0f);
 
     // 2. Mooney-Rivlin 2-Parameter Hyperelastic Stress Model
     float lambda_sq = lambda * lambda;
@@ -192,13 +273,18 @@ void update_balloon_physics_ext(float pressure_kpa, float dp_dt, float d2p_dt2, 
     current_impact = classify_pressure_event(dp_dt, d2p_dt2, pressure_kpa);
     currentPhysics.impact_type = current_impact;
 
-    if (current_impact == IMPACT_BURST) {
+    if (current_impact == IMPACT_BURST || tear_precursor_detected) {
         currentPhysics.burst_shock_detected = true;
-        ESP_LOGW(TAG, "BURST SHOCK CONFIRMED! dP/dt = %.2f kPa/s at P = %.2f kPa", dp_dt, pressure_kpa);
+        if (tear_precursor_detected) {
+            ESP_LOGW(TAG, "MICRO-FLUTTER TEAR PRECURSOR DETECTED! Var: %.1f", current_flutter_variance);
+        } else {
+            ESP_LOGW(TAG, "BURST SHOCK CONFIRMED! dP/dt = %.2f kPa/s at P = %.2f kPa", dp_dt, pressure_kpa);
+        }
     } else {
         currentPhysics.burst_shock_detected = false;
     }
 }
+
 
 BalloonMaterialPhysics get_balloon_physics_state() {
     return currentPhysics;

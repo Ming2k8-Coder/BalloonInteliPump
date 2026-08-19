@@ -93,5 +93,9 @@ PopBlackBoxSample get_pop_sample(int index);
 float get_last_pop_peak();
 void dump_pop_recording();
 
+// Minimum-Jerk S-Curve Profile Generator
+float update_scurve_profile(float current_val, float target_val, float max_vel, float dt_sec);
+
 #endif // BIP_STATE_H
+
 

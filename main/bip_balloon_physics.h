@@ -41,6 +41,13 @@ typedef struct {
     float burst_safety_margin_pct;   // Distance to burst limit (%)
 } RideInflationAdvice;
 
+typedef struct {
+    float estimated_C10;           // Identified C10 parameter (kPa)
+    float estimated_C01;           // Identified C01 parameter (kPa)
+    float r_squared;               // Goodness of fit (0.0 to 1.0)
+    bool  converged;               // Parameter identification convergence flag
+} OnlineMaterialParams;
+
 void init_balloon_physics(BalloonType type);
 void update_balloon_physics(float pressure_kpa, float dp_dt, float dt_sec);
 void update_balloon_physics_ext(float pressure_kpa, float dp_dt, float d2p_dt2, float mcu_temp_c, float dt_sec);
@@ -65,5 +72,14 @@ void set_learned_burst_threshold(float threshold);
 float get_learned_burst_threshold();
 void update_burst_threshold_from_pop();
 
+// Online Mooney-Rivlin RLS Parameter Identification
+void update_online_material_identification(float pressure_kpa, float stretch_ratio);
+OnlineMaterialParams get_online_material_params();
+
+// Acoustic Tear Precursor Micro-Flutter Detector
+bool is_tear_precursor_flutter_detected();
+float get_flutter_variance();
+
 #endif // BIP_BALLOON_PHYSICS_H
+
 

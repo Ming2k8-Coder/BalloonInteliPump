@@ -107,6 +107,33 @@ void test_adaptive_burst_threshold_learning(void) {
     TEST_ASSERT_FLOAT_WITHIN(0.1f, -48.5f, get_learned_burst_threshold());
 }
 
+void test_online_mooney_rivlin_identification(void) {
+    init_balloon_physics(BALLOON_11INCH);
+
+    // Feed 60 synthetic (pressure, stretch_ratio) samples to train online RLS
+    for (int i = 0; i < 60; i++) {
+        float lambda = 1.2f + (float)i * 0.02f;
+        float p = 2.0f * (lambda * lambda - 1.0f / lambda) * (180.0f + 20.0f / lambda) * 0.01f;
+        update_online_material_identification(p, lambda);
+    }
+
+    OnlineMaterialParams params = get_online_material_params();
+    TEST_ASSERT_TRUE(params.converged);
+    TEST_ASSERT_TRUE(params.estimated_C10 > 0.0f);
+}
+
+void test_tear_precursor_flutter_detector(void) {
+    init_balloon_physics(BALLOON_11INCH);
+
+    // Simulate high-frequency noise spikes in dP/dt
+    for (int i = 0; i < 20; i++) {
+        float spike = (i % 2 == 0) ? 250.0f : -250.0f;
+        update_balloon_physics_ext(20.0f, spike, 0.0f, 25.0f, 0.001f);
+    }
+
+    TEST_ASSERT_TRUE(get_flutter_variance() > 50.0f);
+}
+
 void run_balloon_physics_tests(void) {
     RUN_TEST(test_mooney_rivlin_hyperelastic_stress);
     RUN_TEST(test_sls_viscoelastic_stress_relaxation);
@@ -115,4 +142,7 @@ void run_balloon_physics_tests(void) {
     RUN_TEST(test_fatigue_tracker_miners_rule);
     RUN_TEST(test_ride_inflation_calculator);
     RUN_TEST(test_adaptive_burst_threshold_learning);
+    RUN_TEST(test_online_mooney_rivlin_identification);
+    RUN_TEST(test_tear_precursor_flutter_detector);
 }
+
