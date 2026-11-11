@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "driver/uart.h"
 #include "lwip/sockets.h"
+#include <atomic>
 
 #include "bip_config.h"
 #include "bip_sensors.h"
@@ -32,9 +33,10 @@ static spi_device_handle_t ads1220_spi_handle = NULL;
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 static TaskHandle_t s_controlTaskHandle = NULL;
 
-static bool isConnected = false;
-static bool wifiConnected = false;
-static uint32_t totalSamplesProcessed = 0;
+static std::atomic<bool> isConnected{false};
+static std::atomic<bool> wifiConnected{false};
+static std::atomic<uint32_t> totalSamplesProcessed{0};
+static std::atomic<uint32_t> telemetryDropCount{0};
 
 static void execute_command(const char* cmd);
 
@@ -65,6 +67,14 @@ static void control_task(void *pvParameters) {
             update_adc_sensors(adc_handle);
         }
 
+        // FW-SAFE-02: Global real-time overpressure safety cutoff (50.0 kPa default ceiling)
+        float currentPressure = pressureSensor.getValue();
+        if (currentPressure >= get_max_system_pressure() && currentMode != MODE_ERROR) {
+            pumpMotor.emergencyStop();
+            write_solenoid_pwm(255); // Dump pressurized air immediately
+            trigger_error("OVERPRESSURE", "MAX PRESSURE EXCEEDED");
+        }
+
         // 3. Safety Check & Motor Update
         pumpMotor.update(currentSensor.getValue(), voltageSensor.getValue(), 12.0f);
         if (pumpMotor.isSafetyTriggered() && currentMode != MODE_ERROR) {
@@ -74,9 +84,19 @@ static void control_task(void *pvParameters) {
         // 4. Update PID & State Machine
         update_state_machine();
         float mcu_temp = read_mcu_temp();
-        update_volume_estimator_ext(pressureSensor.getValue(), (float)pumpMotor.getCurrentPWM(), mcu_temp, 0.0005f);
+        update_volume_estimator_ext(pressureSensor.getValue(), (float)pumpMotor.getCurrentPWM(), (float)get_solenoid_pwm(), mcu_temp, 0.0005f);
         update_balloon_physics_ext(pressureSensor.getValue(), get_local_dp_dt(), get_local_d2p_dt2(), mcu_temp, 0.0005f);
         totalSamplesProcessed++;
+
+        // FW-SAFE-03: Immediate real-time burst shock cutoff
+        BalloonMaterialPhysics phys = get_balloon_physics_state();
+        if (phys.burst_shock_detected) {
+            pumpMotor.emergencyStop();
+            write_solenoid_pwm(255); // Open relief valve to purge manifold
+            if (currentMode != MODE_ERROR && currentMode != MODE_BURST) {
+                trigger_error("BURST SAFETY", "BURST SHOCK DETECTED");
+            }
+        }
 
         // 5. Continuous High-Precision Pop Black Box RAM Recording (2000 SPS)
         record_pop_sample(pressureSensor.getValue(), pressureSensor.getRawValue(),
@@ -95,10 +115,16 @@ static void control_task(void *pvParameters) {
             localSample.rawCurrent = currentSensor.getRawValue();
             localSample.mcuTemp = mcu_temp;
 
-            xRingbufferSend(telemetryRingBuf, &localSample, sizeof(TelemetrySample), 0);
+            BaseType_t res = xRingbufferSend(telemetryRingBuf, &localSample, sizeof(TelemetrySample), 0);
+            if (res != pdTRUE) {
+                telemetryDropCount++;
+            }
         }
     }
 }
+
+// PY-NET-01: Forward declaration for command executor
+static void execute_command(const char* cmd);
 
 // ==========================================
 // 2. FREERTOS CORE 0 TASK: NETWORKING & BSD UDP SOCKETS
@@ -116,6 +142,24 @@ static void net_telemetry_task(void *pvParameters) {
     int broadcast = 1;
     setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
 
+    // Prevent blocking on slow/full network buffers
+    struct timeval snd_to = { .tv_sec = 0, .tv_usec = 20000 }; // 20ms timeout
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
+
+    // PY-NET-01: Bind socket to local UDP_PORT to listen for commands
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons(UDP_PORT);
+    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        ESP_LOGE(TAG, "Unable to bind UDP socket to port %d: errno %d", UDP_PORT, errno);
+    }
+
+    // PY-NET-01: Non-blocking 1ms receive timeout for incoming datagrams
+    struct timeval rcv_to = { .tv_sec = 0, .tv_usec = 1000 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+
     struct sockaddr_in dest_addr;
     dest_addr.sin_addr.s_addr = inet_addr(UDP_BROADCAST_IP);
     dest_addr.sin_family = AF_INET;
@@ -126,6 +170,29 @@ static void net_telemetry_task(void *pvParameters) {
     int sampleBatchCount = 0;
 
     while (1) {
+        // PY-NET-01: Listen for incoming UDP commands (CONNECT, STOP, MODE, etc.)
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        char cmd_buf[128];
+        int rx_bytes = recvfrom(sock, cmd_buf, sizeof(cmd_buf) - 1, 0, (struct sockaddr *)&from_addr, &from_len);
+        if (rx_bytes > 0) {
+            cmd_buf[rx_bytes] = '\0';
+            for (int i = 0; i < rx_bytes; i++) {
+                if (cmd_buf[i] == '\r' || cmd_buf[i] == '\n') {
+                    cmd_buf[i] = '\0';
+                    break;
+                }
+            }
+            if (strlen(cmd_buf) > 0) {
+                ESP_LOGI(TAG, "UDP Command received: %s from %s", cmd_buf, inet_ntoa(from_addr.sin_addr));
+                if (strcmp(cmd_buf, "CONNECT") == 0) {
+                    isConnected = true;
+                    dest_addr = from_addr; // Direct telemetry unicast back to sender
+                }
+                execute_command(cmd_buf);
+            }
+        }
+
         size_t item_size = 0;
         TelemetrySample *sample = (TelemetrySample *)xRingbufferReceive(telemetryRingBuf, &item_size, pdMS_TO_TICKS(50));
         
@@ -143,6 +210,14 @@ static void net_telemetry_task(void *pvParameters) {
                 char line[160];
                 int line_len = snprintf(line, sizeof(line), "$%s*%02X\n", payload, checksum);
                 
+                if (offset + line_len >= sizeof(packetBuffer) - 1) {
+                    if (offset > 0) {
+                        sendto(sock, packetBuffer, offset, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+                        offset = 0;
+                        sampleBatchCount = 0;
+                    }
+                }
+
                 if (offset + line_len < sizeof(packetBuffer) - 1) {
                     strcpy(packetBuffer + offset, line);
                     offset += line_len;
@@ -156,6 +231,20 @@ static void net_telemetry_task(void *pvParameters) {
                 }
             }
             vRingbufferReturnItem(telemetryRingBuf, (void *)sample);
+        } else if (sample == NULL && offset > 0) {
+            // Flush partial batch on receive timeout
+            sendto(sock, packetBuffer, offset, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            offset = 0;
+            sampleBatchCount = 0;
+        }
+
+        // FW-PERF-01: Process Pop Black Box heavy calculations on Core 0 outside 500us control loop
+        if (sysEventGroup != NULL) {
+            EventBits_t popBits = xEventGroupWaitBits(sysEventGroup, BIP_EVENT_POP_TRIGGERED, pdTRUE, pdFALSE, 0);
+            if (popBits & BIP_EVENT_POP_TRIGGERED) {
+                ESP_LOGI(TAG, "POP EVENT DETECTED: Running burst threshold analysis on Core 0...");
+                update_burst_threshold_from_pop();
+            }
         }
     }
 }
@@ -202,6 +291,16 @@ static void execute_command(const char* cmd) {
     if (strcmp(cmd, "CONNECT") == 0) {
         isConnected = true;
         printf("CONNECTED\n");
+    } else if (strcmp(cmd, "PING") == 0) {
+        printf("PONG\n");
+    } else if (strncmp(cmd, "MODE ", 5) == 0) {
+        int m = atoi(cmd + 5);
+        if (m >= 0 && m <= 10) {
+            post_mode_change((SystemMode)m);
+            printf("MODE_SET %d\n", m);
+        } else {
+            printf("ERR_INVALID_MODE %d\n", m);
+        }
     } else if (strcmp(cmd, "START_MANUAL") == 0) {
         post_mode_change(MODE_MANUAL);
     } else if (strcmp(cmd, "START_SMART") == 0) {
@@ -275,32 +374,64 @@ static void execute_command(const char* cmd) {
     } else if (strcmp(cmd, "STOP") == 0) {
         pumpMotor.emergencyStop();
         post_mode_change(MODE_IDLE);
+        write_solenoid_pwm(255); // FW-SAFE-04: Failsafe venting, dump trapped pressure
+        printf("STOPPED_AND_VENTED\n");
     } else if (strcmp(cmd, "VALVE_ON") == 0) {
         write_solenoid_pwm(255);
         printf("VALVE_OPEN\n");
     } else if (strcmp(cmd, "VALVE_OFF") == 0) {
         write_solenoid_pwm(0);
         printf("VALVE_CLOSED\n");
-    } else if (strncmp(cmd, "SET_VALVE_PWM ", 14) == 0) {
-        int val = atoi(cmd + 14);
-        write_solenoid_pwm(std::clamp(val, 0, 255));
-        printf("VALVE_PWM_SET %d\n", val);
-    } else if (strncmp(cmd, "SET_PWM ", 8) == 0) {
-        int val = atoi(cmd + 8);
+    } else if (strncmp(cmd, "SET_VALVE_PWM ", 14) == 0 || strncmp(cmd, "VENT ", 5) == 0) {
+        const char* arg = (strncmp(cmd, "VENT ", 5) == 0) ? (cmd + 5) : (cmd + 14);
+        int val = atoi(arg);
+        write_solenoid_pwm((uint8_t)std::clamp(val, 0, 255));
+        printf("VALVE_PWM_SET %d\n", std::clamp(val, 0, 255));
+    } else if (strncmp(cmd, "SET_PWM ", 8) == 0 || strncmp(cmd, "PWM ", 4) == 0) {
+        const char* arg = (strncmp(cmd, "PWM ", 4) == 0) ? (cmd + 4) : (cmd + 8);
+        int val = atoi(arg);
         set_manual_mode(false);
-        pumpMotor.setTargetPWM(std::clamp(val, 0, 255));
-    } else if (strncmp(cmd, "SET_TARGET ", 11) == 0) {
-        float val = atof(cmd + 11);
+        pumpMotor.setTargetPWM((uint8_t)std::clamp(val, 0, 255));
+        printf("PWM_SET %d\n", std::clamp(val, 0, 255));
+    } else if (strncmp(cmd, "SET_TARGET ", 11) == 0 || strncmp(cmd, "TARGET ", 7) == 0) {
+        const char* arg = (strncmp(cmd, "TARGET ", 7) == 0) ? (cmd + 7) : (cmd + 11);
+        float val = (float)atof(arg);
         set_manual_target(val);
+        printf("TARGET_SET %.2f\n", val);
+    } else if (strncmp(cmd, "SET_PID ", 8) == 0 || strncmp(cmd, "PID ", 4) == 0) {
+        const char* arg = (strncmp(cmd, "PID ", 4) == 0) ? (cmd + 4) : (cmd + 8);
+        float kp = 25.0f, ki = 1.2f, kd = 4.0f;
+        if (sscanf(arg, "%f %f %f", &kp, &ki, &kd) >= 3) {
+            set_pid(kp, ki, kd);
+            printf("PID_SET kp=%.2f ki=%.2f kd=%.2f\n", kp, ki, kd);
+        } else {
+            printf("ERR_PID_SYNTAX\n");
+        }
+    } else if (strncmp(cmd, "SET_RATIO ", 10) == 0 || strncmp(cmd, "RATIO ", 6) == 0) {
+        const char* arg = (strncmp(cmd, "RATIO ", 6) == 0) ? (cmd + 6) : (cmd + 10);
+        float ratio = (float)atof(arg);
+        set_yield_ratio(ratio);
+        printf("RATIO_SET %.2f\n", ratio);
+    } else if (strncmp(cmd, "SET_LIMITS ", 11) == 0) {
+        float uv = 10.5f, oc = 8.0f; int sag = 85;
+        if (sscanf(cmd + 11, "%f %f %d", &uv, &oc, &sag) >= 3) {
+            SafetySettings s = { .maxCurrent = oc, .minVoltage = uv, .sagLimitPercent = (uint8_t)std::clamp(sag, 0, 100) };
+            pumpMotor.setSafetySettings(s);
+            printf("LIMITS_SET uv=%.1f oc=%.1f sag=%d\n", uv, oc, sag);
+        }
     } else if (strncmp(cmd, "SET_RAMP ", 9) == 0) {
         float rate = atof(cmd + 9);
         pumpMotor.setRampRate(rate);
         printf("RAMP_SET %.2f\n", rate);
+    } else if (strncmp(cmd, "SET_MAX_PRESSURE ", 17) == 0) {
+        float max_p = atof(cmd + 17);
+        set_max_system_pressure(max_p);
+        printf("MAX_PRESSURE_SET %.1f kPa\n", get_max_system_pressure());
     } else if (strncmp(cmd, "SET_BALLOON_TYPE ", 17) == 0) {
         int btype = atoi(cmd + 17);
         set_balloon_preset((BalloonType)std::clamp(btype, 0, 3));
         printf("BALLOON_TYPE_SET %d\n", btype);
-    } else if (strcmp(cmd, "ZERO_PRESSURE") == 0 || strcmp(cmd, "ZERO_TARE") == 0) {
+    } else if (strcmp(cmd, "ZERO_PRESSURE") == 0 || strcmp(cmd, "ZERO_TARE") == 0 || strcmp(cmd, "TARE") == 0) {
         pressureSensor.tare();
         printf("PRESSURE_ZEROED\n");
     } else if (strcmp(cmd, "GET_POP_DUMP") == 0 || strcmp(cmd, "DUMP_POP") == 0) {

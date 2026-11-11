@@ -9,8 +9,15 @@ import queue
 import socket
 import collections
 import os
+import sys
 import urllib.request
 import numpy as np
+
+# PY-CRASH-01: Reconfigure stdout and stderr for UTF-8 with fallback
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # System Constants
 BAUD_RATE = 115200
@@ -18,6 +25,21 @@ DEFAULT_UDP_PORT = 8888
 HTTP_PORT = 8080
 LOG_DIR = "logs"
 MODEL_PATH = "logs/balloon_state_model.pkl"
+
+# PY-SYNC-01: Synchronized Mode Code Definitions (0-10) matching ESP32 bip_state.h
+MODE_NAMES = {
+    0: "IDLE",
+    1: "MANUAL",
+    2: "SMART",
+    3: "BURST",
+    4: "PULSE",
+    5: "PATTERN",
+    6: "CALIBRATION",
+    7: "ERROR",
+    8: "DIAMETER",
+    9: "RIDE",
+    10: "CONDITION",
+}
 
 # Ensure log directory exists
 if not os.path.exists(LOG_DIR):
@@ -69,7 +91,7 @@ def query_local_llm(prompt):
             res = json.loads(response.read().decode('utf-8'))
             return res.get("content")
     except Exception as e:
-        print(f"⚠️ LLM DRIVER: Local LLM offline. Start Ollama or llama.cpp to enable. Error: {e}")
+        print(f"[WARN] LLM DRIVER: Local LLM offline. Start Ollama or llama.cpp to enable. Error: {e}")
         return None
 
 # ----------------------------------------------------------------------
@@ -87,51 +109,91 @@ class RLSPredictor:
         self.forecast_steps = forecast_steps # Steps to forecast ahead (e.g., 15 samples @ 100Hz = 150ms)
         
         # State variables
-        self.w = np.zeros(order)            # AR coefficients (weights)
-        self.P = np.eye(order) * 10.0       # Inverse covariance matrix
-        self.x = collections.deque(maxlen=order) # Input buffer (past samples)
+        self.w = np.zeros(order, dtype=float)            # AR coefficients (weights)
+        self.P = np.eye(order, dtype=float) * 10.0       # Inverse covariance matrix
+        self.x = collections.deque(maxlen=order)         # Input buffer (past samples y(t-1), ..., y(t-p))
+        self.lock = threading.Lock()                     # PY-THRD-01: Lock protecting deque and covariance updates
         
     def update(self, sample):
-        self.x.appendleft(sample)
-        if len(self.x) < self.p:
-            return sample # Not enough data yet
-        
-        x_vector = np.array(list(self.x))
-        
-        # 1. Compute prediction error
-        y_pred = np.dot(x_vector, self.w)
-        error = sample - y_pred
-        
-        # 2. Compute gain vector
-        Px = np.dot(self.P, x_vector)
-        gain = Px / (self.lam + np.dot(x_vector, Px))
-        
-        # 3. Update weights
-        self.w += gain * error
-        
-        # 4. Update inverse covariance matrix
-        self.P = (self.P - np.outer(gain, np.dot(x_vector, self.P))) / self.lam
-        
-        return y_pred
+        with self.lock:
+            try:
+                val = float(sample)
+            except (ValueError, TypeError):
+                return float(self.x[0]) if self.x else 0.0
+
+            if not np.isfinite(val):
+                return float(self.x[0]) if self.x else 0.0
+
+            if len(self.x) < self.p:
+                self.x.appendleft(val)
+                return val
+            
+            # PY-RLS-01: Take historical window [y(t-1), ..., y(t-p)] BEFORE appending current sample!
+            x_vector = np.array(list(self.x), dtype=float)
+            if not np.all(np.isfinite(x_vector)):
+                x_vector = np.zeros(self.p, dtype=float)
+            
+            y_pred = float(np.dot(x_vector, self.w))
+            if not np.isfinite(y_pred):
+                y_pred = float(self.x[0]) if self.x else val
+                self.w = np.zeros(self.p, dtype=float)
+                self.P = np.eye(self.p, dtype=float) * 10.0
+                
+            error = val - y_pred
+            Px = np.dot(self.P, x_vector)
+            denom = float(self.lam + np.dot(x_vector, Px) + 1e-6)
+            if not np.isfinite(denom) or abs(denom) < 1e-9:
+                denom = 1e-6
+            gain = Px / denom
+            
+            self.w += gain * error
+            if not np.all(np.isfinite(self.w)):
+                self.w = np.zeros(self.p, dtype=float)
+                self.P = np.eye(self.p, dtype=float) * 10.0
+            
+            self.P = (self.P - np.outer(gain, np.dot(x_vector, self.P))) / self.lam
+            self.P = 0.5 * (self.P + self.P.T)
+            
+            tr = float(np.trace(self.P))
+            P_max = 10000.0
+            if not np.isfinite(tr) or tr > P_max or np.any(~np.isfinite(self.P)):
+                if np.isfinite(tr) and tr > 0:
+                    self.P = self.P * (P_max / tr)
+                else:
+                    self.P = np.eye(self.p, dtype=float) * 10.0
+                    
+            self.x.appendleft(val)
+            return y_pred
 
     def forecast(self):
         """Forecast future pressure values based on current model weights."""
-        if len(self.x) < self.p:
-            return 0.0
+        with self.lock:
+            if len(self.x) < self.p:
+                return float(self.x[0]) if self.x else 0.0
+                
+            if not np.all(np.isfinite(self.w)):
+                self.w = np.zeros(self.p, dtype=float)
+                
+            pred_buffer = [float(v) if np.isfinite(v) else 0.0 for v in self.x]
+            forecast_val = float(pred_buffer[0]) if pred_buffer else 0.0
             
-        pred_buffer = list(self.x)
-        forecast_val = 0.0
-        
-        # Iteratively forecast steps ahead
-        for _ in range(self.forecast_steps):
-            x_vec = np.array(pred_buffer[:self.p])
-            forecast_val = np.dot(x_vec, self.w)
-            pred_buffer.insert(0, forecast_val)
-            
-        if not np.isfinite(forecast_val):
-            return 0.0
-            
-        return max(0.0, float(forecast_val))
+            # Iteratively forecast steps ahead
+            for _ in range(self.forecast_steps):
+                x_vec = np.array(pred_buffer[:self.p], dtype=float)
+                if not np.all(np.isfinite(x_vec)):
+                    x_vec = np.zeros(self.p, dtype=float)
+                step_val = float(np.dot(x_vec, self.w))
+                if not np.isfinite(step_val):
+                    step_val = float(pred_buffer[0])
+                # Clamp step prediction to physically valid range [0.0, 100.0 kPa]
+                step_val = max(0.0, min(100.0, step_val))
+                forecast_val = step_val
+                pred_buffer.insert(0, forecast_val)
+                
+            if not np.isfinite(forecast_val):
+                forecast_val = float(self.x[0]) if self.x else 0.0
+                
+            return max(0.0, min(100.0, float(forecast_val)))
 
 # ----------------------------------------------------------------------
 # 2. CONNECTION MANAGERS (SERIAL & UDP)
@@ -222,7 +284,18 @@ class UDPManager:
                 if not self.cmd_queue.empty():
                     cmd = self.cmd_queue.get()
                     if self.device_ip:
-                        self.socket.sendto((cmd + '\n').encode(), (self.device_ip, self.port))
+                        try:
+                            self.socket.sendto((cmd + '\n').encode(), (self.device_ip, self.port))
+                        except Exception as e:
+                            print(f"[WARN] UDP send error to {self.device_ip}: {e}")
+                    else:
+                        # PY-NET-01: Broadcast command if device IP is not yet discovered
+                        target_ips = ["<broadcast>", "255.255.255.255", "192.168.4.1"]
+                        for tip in target_ips:
+                            try:
+                                self.socket.sendto((cmd + '\n').encode(), (tip, self.port))
+                            except Exception:
+                                pass
                 
                 try:
                     data, addr = self.socket.recvfrom(4096)
@@ -237,7 +310,7 @@ class UDPManager:
                     pass
             except Exception as e:
                 if self.running:
-                    print(f"UDP Error: {e}")
+                    print(f"[WARN] UDP Error: {e}")
                 break
 
 # ----------------------------------------------------------------------
@@ -266,7 +339,7 @@ class LoonerPleasureDriver:
             # State 1: SQUEEZE (user bouncing/sitting/squeezing), State 3: DANGER (near pop limit)
             if predicted_state in [1, 3]:
                 if not self.valve_open:
-                    print("🎈 LOONER DRIVER [Interactive Give Mode]: Squeeze or Danger detected! Vending valve & halting pump.")
+                    print("[INFO] LOONER DRIVER [Interactive Give Mode]: Squeeze or Danger detected! Vending valve & halting pump.")
                     self.engine.send_cmd("VALVE_ON")
                     self.engine.send_cmd("STOP")
                     self.valve_open = True
@@ -275,7 +348,7 @@ class LoonerPleasureDriver:
                 # Wait 1.5 seconds after squeeze yields before closing valve and pumping back up
                 # to prevent rapid target oscillation
                 if self.valve_open and (now - self.last_state_change > 1.5):
-                    print("🎈 LOONER DRIVER [Interactive Give Mode]: Normal play state restored. Closing valve, refilling.")
+                    print("[INFO] LOONER DRIVER [Interactive Give Mode]: Normal play state restored. Closing valve, refilling.")
                     self.engine.send_cmd("VALVE_OFF")
                     self.engine.send_cmd("START_MANUAL")
                     self.engine.send_cmd(f"SET_TARGET {self.base_target:.1f}")
@@ -311,7 +384,9 @@ class LoonerPleasureDriver:
 
     def _run_llm_query(self):
         try:
-            hist = list(self.engine.history_buffer)
+            # PY-THRD-01: Thread-safe snapshot copy of history_buffer
+            with self.engine.history_lock:
+                hist = list(self.engine.history_buffer)
             if not hist:
                 return
                 
@@ -345,7 +420,7 @@ class LoonerPleasureDriver:
                     valve = decision.get("valve_mode", "PUMP")
                     rationale = decision.get("rationale", "")
                     
-                    print(f"🤖 LLM DECISION: Target = {target:.1f} kPa | Valve = {valve} | Rationale: {rationale}")
+                    print(f"[INFO] LLM DECISION: Target = {target:.1f} kPa | Valve = {valve} | Rationale: {rationale}")
                     
                     # Execute decision
                     if valve == "RELEASE":
@@ -360,7 +435,7 @@ class LoonerPleasureDriver:
                             self.valve_open = False
                         self.engine.send_cmd(f"SET_TARGET {target:.1f}")
         except Exception as e:
-            print(f"⚠️ LLM DRIVER: Error parsing LLM response: {e}")
+            print(f"[WARN] LLM DRIVER: Error parsing LLM response: {e}")
         finally:
             self.llm_busy = False
 
@@ -375,6 +450,10 @@ class TelemetryEngine:
         self.latest_data = {}
         self.clients = []
         self.client_lock = threading.Lock()
+        
+        # PY-THRD-01: Thread synchronization locks
+        self.history_lock = threading.Lock()
+        self.log_lock = threading.Lock()
         
         # High Precision Logging
         self.logging_active = False
@@ -400,11 +479,11 @@ class TelemetryEngine:
             try:
                 import joblib
                 self.ml_model = joblib.load(MODEL_PATH)
-                print(f"🧠 ML MODEL: Successfully loaded RF classifier from {MODEL_PATH}")
+                print(f"[INFO] ML MODEL: Successfully loaded RF classifier from {MODEL_PATH}")
             except Exception as e:
-                print(f"⚠️ ML MODEL: Failed to load RF model: {e}")
+                print(f"[WARN] ML MODEL: Failed to load RF model: {e}")
         else:
-            print("⚠️ ML MODEL: No pre-trained model file found. Classification runs in heuristic fallback.")
+            print("[WARN] ML MODEL: No pre-trained model file found. Classification runs in heuristic fallback.")
         
     def start_connection(self, conn_type, port_or_device):
         self.stop_connection()
@@ -439,22 +518,31 @@ class TelemetryEngine:
             self.connection.send(cmd)
             
     def start_logging(self, filename):
-        self.stop_logging()
-        filepath = os.path.join(LOG_DIR, filename)
-        self.log_file = open(filepath, 'w', newline='')
-        self.csv_writer = csv.writer(self.log_file, doublequote=True)
-        # Full precision headers
-        self.csv_writer.writerow([
-            "Timestamp_Unix", "Time_Device_s", "Pressure_kPa", "PWM", 
-            "Voltage_V", "Current_A", "Mode", "RawP", "RawV", "RawI",
-            "Slope_kPa_s", "Forecasted_P_150ms", "Fatigue_Index", "Health_Pct", "Reserve_Pct"
-        ])
-        self.logging_active = True
+        with self.log_lock:
+            self.stop_logging_unlocked()
+            filepath = os.path.join(LOG_DIR, filename)
+            self.log_file = open(filepath, 'w', newline='')
+            self.csv_writer = csv.writer(self.log_file, doublequote=True)
+            # Full precision headers
+            self.csv_writer.writerow([
+                "Timestamp_Unix", "Time_Device_s", "Pressure_kPa", "PWM", 
+                "Voltage_V", "Current_A", "Mode", "RawP", "RawV", "RawI",
+                "Slope_kPa_s", "Forecasted_P_150ms", "Fatigue_Index", "Health_Pct", "Reserve_Pct"
+            ])
+            self.logging_active = True
         
     def stop_logging(self):
+        with self.log_lock:
+            self.stop_logging_unlocked()
+
+    def stop_logging_unlocked(self):
         self.logging_active = False
         if self.log_file:
-            self.log_file.close()
+            try:
+                self.log_file.flush()
+                self.log_file.close()
+            except Exception:
+                pass
             self.log_file = None
             self.csv_writer = None
 
@@ -485,7 +573,8 @@ class TelemetryEngine:
                 v = float(parts[4])
                 i = float(parts[5])
                 mode_code = int(parts[6])
-                m_str = {0: "IDLE", 1: "MANUAL", 2: "SMART", 3: "BURST", 4: "CALIB", 5: "ERROR"}.get(mode_code, f"MODE_{mode_code}")
+                # PY-SYNC-01: Synchronized mode mapping across all 11 firmware modes
+                m_str = MODE_NAMES.get(mode_code, f"MODE_{mode_code}")
                 
                 raw_p, raw_v, raw_i = 0.0, 0.0, 0.0
                 if len(parts) >= 10:
@@ -501,24 +590,25 @@ class TelemetryEngine:
                 self.predictor.update(p)
                 forecasted_p = self.predictor.forecast()
                 
-                # Predictive Cut-off algorithm (Safety First!)
-                if forecasted_p >= self.estimated_burst * 0.95 and mode_code in [1, 2, 3]:
-                    print(f"⚠️ PREDICTIVE BURST SAFETY ACTIVE: Forecasted {forecasted_p:.2f} kPa >= Limit {self.estimated_burst * 0.95:.2f} kPa. Halting pump!")
+                # PY-SAFE-01: Extend predictive burst cutoff to all active inflating modes [1, 2, 3, 4, 5, 8, 9, 10]
+                if forecasted_p >= self.estimated_burst * 0.95 and mode_code in [1, 2, 3, 4, 5, 8, 9, 10]:
+                    print(f"[WARN] PREDICTIVE BURST SAFETY ACTIVE: Forecasted {forecasted_p:.2f} kPa >= Limit {self.estimated_burst * 0.95:.2f} kPa. Halting pump!")
                     self.send_cmd("STOP")
                 
-                # 2. Savitzky-Golay / Regression dP/dt Slope
-                self.slope_buffer.append((t_device, p))
-                slope = 0.0
-                if len(self.slope_buffer) >= 5:
-                    xs = [pt[0] for pt in self.slope_buffer]
-                    ys = [pt[1] for pt in self.slope_buffer]
-                    n = len(xs)
-                    mean_x = sum(xs) / n
-                    mean_y = sum(ys) / n
-                    num = sum((xs[idx] - mean_x) * (ys[idx] - mean_y) for idx in range(n))
-                    custom_den = sum((xs[idx] - mean_x) ** 2 for idx in range(n))
-                    if custom_den > 1e-6:
-                        slope = num / custom_den
+                # 2. Savitzky-Golay / Regression dP/dt Slope with thread lock
+                with self.history_lock:
+                    self.slope_buffer.append((t_device, p))
+                    slope = 0.0
+                    if len(self.slope_buffer) >= 5:
+                        xs = [pt[0] for pt in self.slope_buffer]
+                        ys = [pt[1] for pt in self.slope_buffer]
+                        n = len(xs)
+                        mean_x = sum(xs) / n
+                        mean_y = sum(ys) / n
+                        num = sum((xs[idx] - mean_x) * (ys[idx] - mean_y) for idx in range(n))
+                        custom_den = sum((xs[idx] - mean_x) ** 2 for idx in range(n))
+                        if custom_den > 1e-6:
+                            slope = num / custom_den
 
                 # 3. Cubic Fatigue Index & Health decay
                 if self.last_time is not None:
@@ -532,16 +622,17 @@ class TelemetryEngine:
                 reserve_pct = max(0.0, ((self.estimated_burst - p) / self.estimated_burst) * 100.0)
 
                 # 4. Advanced Material Analytics (Online Rolling Features)
-                self.history_buffer.append({
-                    "p": p,
-                    "v": v,
-                    "i": i,
-                    "pwm": pwm,
-                    "slope": slope
-                })
+                with self.history_lock:
+                    self.history_buffer.append({
+                        "p": p,
+                        "v": v,
+                        "i": i,
+                        "pwm": pwm,
+                        "slope": slope
+                    })
+                    hist_p = [item["p"] for item in self.history_buffer]
                 
-                # DSP calculations matching training columns
-                hist_p = [item["p"] for item in self.history_buffer]
+                # DSP calculations matching training columns (ddof=0)
                 p_var = float(np.var(hist_p[-30:])) if len(hist_p) >= 2 else 0.0
                 p_integral = float(sum(hist_p[-50:])) * 0.01 if len(hist_p) >= 1 else 0.0
                 power = v * i
@@ -550,6 +641,7 @@ class TelemetryEngine:
 
                 # 5. Live State Classification (Scikit-Learn Random Forest or Heuristic Fallback)
                 predicted_state = 0 # Default: STABLE (0)
+                rf_success = False
                 if self.ml_model is not None:
                     try:
                         feature_vector = np.array([[
@@ -557,9 +649,11 @@ class TelemetryEngine:
                             p_var, p_integral, power, power_ratio, creep
                         ]])
                         predicted_state = int(self.ml_model.predict(feature_vector)[0])
+                        rf_success = True
                     except Exception as e:
-                        pass
-                else:
+                        rf_success = False
+                
+                if not rf_success:
                     # Fallback Heuristics
                     if health_pct <= 20.0 or p >= 45.0:
                         predicted_state = 3 # DANGER
@@ -567,6 +661,8 @@ class TelemetryEngine:
                         predicted_state = 2 # YIELDING
                     elif slope > 1.5 and mode_code == 1:
                         predicted_state = 1 # SQUEEZE
+                    else:
+                        predicted_state = 0 # STABLE
                 
                 ml_state_str = {0: "STABLE", 1: "SQUEEZE", 2: "YIELDING", 3: "DANGER"}.get(predicted_state, "STABLE")
 
@@ -592,15 +688,16 @@ class TelemetryEngine:
                 # 6. Execute Looner Pleasure Custom Driver rules
                 self.pleasure_driver.update(self.latest_data, predicted_state)
                 
-                # Full Precision CSV logging
-                if self.logging_active and self.csv_writer:
-                    self.csv_writer.writerow([
-                        f"{time.time():.6f}", f"{t_device:.3f}", f"{p:.4f}", pwm,
-                        f"{v:.4f}", f"{i:.4f}", m_str, f"{raw_p:.2f}", f"{raw_v:.2f}", f"{raw_i:.2f}",
-                        f"{slope:.4f}", f"{forecasted_p:.4f}", f"{self.fatigue_index:.6f}", 
-                        f"{health_pct:.2f}", f"{reserve_pct:.2f}"
-                    ])
-                    self.log_file.flush()
+                # Full Precision CSV logging protected by lock
+                with self.log_lock:
+                    if self.logging_active and self.csv_writer and self.log_file and not self.log_file.closed:
+                        self.csv_writer.writerow([
+                            f"{time.time():.6f}", f"{t_device:.3f}", f"{p:.4f}", pwm,
+                            f"{v:.4f}", f"{i:.4f}", m_str, f"{raw_p:.2f}", f"{raw_v:.2f}", f"{raw_i:.2f}",
+                            f"{slope:.4f}", f"{forecasted_p:.4f}", f"{self.fatigue_index:.6f}", 
+                            f"{health_pct:.2f}", f"{reserve_pct:.2f}"
+                        ])
+                        self.log_file.flush()
 
                 # Broadcast to connected browser clients (SSE)
                 self.broadcast_data(self.latest_data)
@@ -621,7 +718,11 @@ class TelemetryEngine:
         data_str = f"data: {json.dumps(data)}\n\n"
         with self.client_lock:
             for client in list(self.clients):
-                client.put(data_str)
+                try:
+                    # PY-THRD-01: Non-blocking put to avoid unbounded queues on slow clients
+                    client.put_nowait(data_str)
+                except queue.Full:
+                    pass
 
 # Global Telemetry Engine Instance
 engine = TelemetryEngine()
@@ -645,7 +746,8 @@ class WebServerHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             
-            q = queue.Queue()
+            # PY-THRD-01: Bounded SSE queue to prevent memory leak on slow clients
+            q = queue.Queue(maxsize=100)
             engine.add_client(q)
             
             try:
@@ -732,10 +834,17 @@ class WebServerHandler(http.server.SimpleHTTPRequestHandler):
         elif parsed_url.path == "/api/config":
             burst = params.get("estimated_burst")
             if burst is not None:
-                engine.estimated_burst = float(burst)
-                self.send_json({"success": True})
+                try:
+                    burst_val = float(burst)
+                    if burst_val > 0.0:
+                        engine.estimated_burst = burst_val
+                        self.send_json({"success": True})
+                    else:
+                        self.send_json({"success": False, "error": "estimated_burst must be greater than 0"})
+                except ValueError:
+                    self.send_json({"success": False, "error": "Invalid estimated_burst"})
             else:
-                self.send_json({"success": False})
+                self.send_json({"success": False, "error": "Missing estimated_burst"})
                 
         elif parsed_url.path == "/api/driver":
             mode = params.get("mode")
@@ -1609,8 +1718,8 @@ def run_server():
     httpd = ThreadedHTTPServer(server_address, WebServerHandler)
     
     print(f"\n==================================================")
-    print(f"🚀 BIP Headless Server Launching Successfully!")
-    print(f"🔗 WebGUI dashboard address: http://localhost:{HTTP_PORT}")
+    print(f"[INFO] BIP Headless Server Launching Successfully!")
+    print(f"[INFO] WebGUI dashboard address: http://localhost:{HTTP_PORT}")
     print(f"==================================================\n")
     
     try:

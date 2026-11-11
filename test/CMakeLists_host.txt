@@ -1,0 +1,31 @@
+cmake_minimum_required(VERSION 3.16)
+project(BIP_Host_Tests CXX C)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/mocks
+    ${CMAKE_CURRENT_SOURCE_DIR}/mocks/unity
+    ${CMAKE_CURRENT_SOURCE_DIR}/mocks/freertos
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(bip_firmware_tests
+    mocks/unity/unity.c
+    mocks/esp_stubs.cpp
+    ../main/bip_volume_estimator.cpp
+    ../main/bip_balloon_physics.cpp
+    ../main/bip_state.cpp
+    ../main/bip_sensors.cpp
+    ../main/bip_motor.cpp
+    ../main/bip_storage.cpp
+    test_main_host.cpp
+    test_bip_sensors.cpp
+    test_bip_motor.cpp
+    test_bip_state.cpp
+    test_bip_storage.cpp
+    test_bip_balloon_physics.cpp
+    test_bip_volume_estimator.cpp
+)

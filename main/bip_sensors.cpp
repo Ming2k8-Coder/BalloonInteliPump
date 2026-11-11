@@ -25,6 +25,7 @@ static void IRAM_ATTR drdy_gpio_isr_handler(void* arg) {
 }
 
 BIP_Sensor::BIP_Sensor(const char* name) : _kalman(0.02f, 0.5f, 1.0f) {
+    _mux = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     _name = name;
     _windowSize = 10;
     _histIndex = 0;
@@ -37,6 +38,7 @@ BIP_Sensor::BIP_Sensor(const char* name) : _kalman(0.02f, 0.5f, 1.0f) {
 }
 
 void BIP_Sensor::setRawValue(float volts) {
+    portENTER_CRITICAL(&_mux);
     _runningSum -= _history[_histIndex];
     _history[_histIndex] = volts;
     _runningSum += _history[_histIndex];
@@ -50,45 +52,71 @@ void BIP_Sensor::setRawValue(float volts) {
     }
     
     _rawVolts = _runningSum / _windowSize;
-    float unFiltered = mapMultiPoint(_rawVolts);
+    float unFiltered = mapMultiPoint_unlocked(_rawVolts);
     _currentValue = _kalman.update(unFiltered);
+    portEXIT_CRITICAL(&_mux);
 }
 
 float BIP_Sensor::getRawValue() {
-    return _rawVolts;
+    portENTER_CRITICAL(&_mux);
+    float val = _rawVolts;
+    portEXIT_CRITICAL(&_mux);
+    return val;
 }
 
 float BIP_Sensor::getValue() {
-    return _currentValue - _zeroOffset;
+    portENTER_CRITICAL(&_mux);
+    float val = _currentValue - _zeroOffset;
+    portEXIT_CRITICAL(&_mux);
+    return val;
 }
 
 float BIP_Sensor::getFilteredValue() {
-    return _kalman.getValue() - _zeroOffset;
+    portENTER_CRITICAL(&_mux);
+    float val = _kalman.getValue() - _zeroOffset;
+    portEXIT_CRITICAL(&_mux);
+    return val;
 }
 
 void BIP_Sensor::tare() {
+    portENTER_CRITICAL(&_mux);
     _zeroOffset = _currentValue;
+    portEXIT_CRITICAL(&_mux);
 }
 
 void BIP_Sensor::resetTare() {
+    portENTER_CRITICAL(&_mux);
     _zeroOffset = 0.0f;
+    portEXIT_CRITICAL(&_mux);
 }
 
 float BIP_Sensor::getZeroOffset() {
-    return _zeroOffset;
+    portENTER_CRITICAL(&_mux);
+    float val = _zeroOffset;
+    portEXIT_CRITICAL(&_mux);
+    return val;
 }
 
 void BIP_Sensor::resetCalibration() {
+    portENTER_CRITICAL(&_mux);
     _calData.numPoints = 0;
     _zeroOffset = 0.0f;
     _kalman.reset(0.0f);
+    portEXIT_CRITICAL(&_mux);
 }
 
 void BIP_Sensor::addCalibrationPoint(float measuredRaw, float knownReal) {
-    if (_calData.numPoints >= MAX_CAL_POINTS) return;
+    portENTER_CRITICAL(&_mux);
+    if (_calData.numPoints >= MAX_CAL_POINTS) {
+        portEXIT_CRITICAL(&_mux);
+        return;
+    }
     
     for (int i = 0; i < _calData.numPoints; i++) {
-        if (std::abs(_calData.points[i].rawValue - measuredRaw) < 1e-6f) return;
+        if (std::abs(_calData.points[i].rawValue - measuredRaw) < 1e-6f) {
+            portEXIT_CRITICAL(&_mux);
+            return;
+        }
     }
     
     _calData.points[_calData.numPoints].rawValue = measuredRaw;
@@ -104,17 +132,30 @@ void BIP_Sensor::addCalibrationPoint(float measuredRaw, float knownReal) {
             }
         }
     }
+    portEXIT_CRITICAL(&_mux);
 }
 
 SensorCalibration BIP_Sensor::getCalibration() {
-    return _calData;
+    portENTER_CRITICAL(&_mux);
+    SensorCalibration cal = _calData;
+    portEXIT_CRITICAL(&_mux);
+    return cal;
 }
 
 void BIP_Sensor::setCalibration(SensorCalibration cal) {
+    portENTER_CRITICAL(&_mux);
     _calData = cal;
+    portEXIT_CRITICAL(&_mux);
 }
 
 float BIP_Sensor::mapMultiPoint(float x) {
+    portENTER_CRITICAL(&_mux);
+    float val = mapMultiPoint_unlocked(x);
+    portEXIT_CRITICAL(&_mux);
+    return val;
+}
+
+float BIP_Sensor::mapMultiPoint_unlocked(float x) {
     if (_calData.numPoints < 2) return x;
     
     if (x <= _calData.points[0].rawValue) {
@@ -168,7 +209,11 @@ esp_err_t init_spi_ads1220(spi_device_handle_t *spi_handle) {
         return ret;
     }
 
-    uint8_t tx_data[5] = { 0x43, 0x81, 0xCE, 0x00, 0x00 };
+    // Reg 0 (0x81): AINP=AIN0, AINN=AVSS, Gain=1, PGA bypassed
+    // Reg 1 (0xD4): DR=110 (2000 SPS Turbo), MODE=10 (Turbo mode), CM=1 (Continuous), TS=0 (Temp sensor disabled), BCS=0
+    // Reg 2 (0x00): VREF=Internal 2.048V, filter off, low-side switch open, IDAC off
+    // Reg 3 (0x00): IDACs disconnected, DRDY pin only
+    uint8_t tx_data[5] = { 0x43, 0x81, 0xD4, 0x00, 0x00 };
     spi_transaction_t t = {};
     t.length = 8 * 5;
     t.tx_buffer = tx_data;
@@ -184,22 +229,25 @@ esp_err_t init_spi_ads1220(spi_device_handle_t *spi_handle) {
 }
 
 int32_t read_ads1220_raw(spi_device_handle_t spi_handle) {
-    uint8_t tx_cmd = 0x12;
-    uint8_t rx_data[3] = {0};
+    // Single 4-byte SPI transaction keeping CS asserted across command byte (0x12) and 3 data bytes.
+    // Transmit: [0x12 (RDATA), 0x00 (dummy), 0x00 (dummy), 0x00 (dummy)]
+    // Receive:  [dummy, MSB (bits 23:16), MID (bits 15:8), LSB (bits 7:0)]
+    uint8_t tx_buf[4] = { 0x12, 0x00, 0x00, 0x00 };
+    uint8_t rx_buf[4] = { 0 };
 
     spi_transaction_t t = {};
-    t.length = 8;
-    t.tx_buffer = &tx_cmd;
-    spi_device_polling_transmit(spi_handle, &t);
+    t.length = 8 * 4; // 32 bits
+    t.tx_buffer = tx_buf;
+    t.rx_buffer = rx_buf;
+    esp_err_t ret = spi_device_polling_transmit(spi_handle, &t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI transmission error in read_ads1220_raw: %d", ret);
+        return 0;
+    }
 
-    t.length = 8 * 3;
-    t.tx_buffer = NULL;
-    t.rx_buffer = rx_data;
-    spi_device_polling_transmit(spi_handle, &t);
-
-    int32_t raw_val = ((int32_t)rx_data[0] << 16) | ((int32_t)rx_data[1] << 8) | rx_data[2];
+    int32_t raw_val = ((int32_t)rx_buf[1] << 16) | ((int32_t)rx_buf[2] << 8) | (int32_t)rx_buf[3];
     if (raw_val & 0x800000) {
-        raw_val |= 0xFF000000;
+        raw_val |= 0xFF000000; // Sign-extend 24-bit 2's complement to 32-bit signed int
     }
     return raw_val;
 }

@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include <atomic>
 
 enum SystemMode {
     MODE_IDLE = 0,
@@ -49,9 +50,11 @@ typedef struct {
 #define BIP_EVENT_POP_TRIGGERED   (1 << 7)
 #define BIP_EVENT_MODE_RIDE      (1 << 8)
 #define BIP_EVENT_MODE_DIAMETER   (1 << 9)
+#define BIP_EVENT_MODE_CONDITION  (1 << 10)
+#define BIP_EVENT_SMART_FINISHED  (1 << 11)
 
 extern EventGroupHandle_t sysEventGroup;
-extern SystemMode currentMode;
+extern std::atomic<SystemMode> currentMode;
 
 void init_states();
 void update_state_machine();
@@ -64,6 +67,10 @@ void set_pid(float kp, float ki, float kd);
 void set_pid_feedforward(float kff);
 void set_hysteresis_band(float deadband_kpa);
 void trigger_error(const char* e1, const char* e2);
+
+// Global Overpressure Ceiling Configuration
+float get_max_system_pressure();
+void set_max_system_pressure(float ceiling_kpa);
 
 // Looner & Balloon Specific Play Modes
 void set_pulse_params(float base_pressure, float amplitude, float frequency_hz);

@@ -15,6 +15,7 @@ BIP_Motor::BIP_Motor(gpio_num_t pin) {
     _sagPwmLimit = 255;
     _idleVoltsSnapshot = 0;
     _ocOverCount = 0;
+    _ocDebounceLimit = SAFETY_OC_DEBOUNCE_SAMPLES;
     _errorMsg = "";
     
     _safety.maxCurrent = SAFETY_OC_DEFAULT;
@@ -87,6 +88,14 @@ void BIP_Motor::clearSafetyLockout() {
     _ocOverCount = 0;
 }
 
+void BIP_Motor::setOcDebounceSamples(uint16_t samples) {
+    _ocDebounceLimit = (samples > 0) ? samples : 1;
+}
+
+uint16_t BIP_Motor::getOcDebounceSamples() const {
+    return _ocDebounceLimit;
+}
+
 const char* BIP_Motor::getSafetyError() {
     return _errorMsg;
 }
@@ -115,7 +124,7 @@ void BIP_Motor::update(float currentAmps, float inputVolts, float idleVolts) {
     
     if (currentAmps > _safety.maxCurrent) {
         _ocOverCount++;
-        if (_ocOverCount >= 3) {
+        if (_ocOverCount >= _ocDebounceLimit) {
             _safetyTriggered = true;
             _errorMsg = "OC_LOCK";
             emergencyStop();
@@ -160,7 +169,15 @@ esp_err_t init_solenoid_valve() {
     return ledc_channel_config(&ch_conf);
 }
 
+static uint8_t s_solenoid_pwm = 0;
+
 void write_solenoid_pwm(uint8_t pwm) {
+    s_solenoid_pwm = pwm;
     ledc_set_duty(LEDC_HIGH_SPEED_MODE, VALVE_PWM_CHANNEL, pwm);
     ledc_update_duty(LEDC_HIGH_SPEED_MODE, VALVE_PWM_CHANNEL);
 }
+
+uint8_t get_solenoid_pwm() {
+    return s_solenoid_pwm;
+}
+

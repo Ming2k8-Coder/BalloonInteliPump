@@ -22,7 +22,7 @@
 #define PIN_CURRENT_ADC_CH  ADC_CHANNEL_7 // GPIO 35
 
 // PWM Actuator Outputs
-#define PIN_MOTOR_PWM       GPIO_NUM_3
+#define PIN_MOTOR_PWM       GPIO_NUM_25 // Remapped from GPIO 3 to avoid UART0 RX contention
 #define PIN_SOLENOID_VALVE  GPIO_NUM_12
 
 // ==========================================
@@ -46,6 +46,8 @@
 #define SAFETY_UV_DEFAULT   10.5f // Volts
 #define SAFETY_OC_DEFAULT   4.5f  // Amps
 #define SAFETY_SAG_DEFAULT  10    // % Drop allowed
+#define SAFETY_OC_DEBOUNCE_SAMPLES 50 // 50 samples @ 2000 SPS = 25 ms inrush tolerance
+#define MAX_SYSTEM_PRESSURE_KPA 50.0f // Global overpressure cutoff ceiling (kPa)
 
 // Telemetry Buffer & FreeRTOS Settings
 #define TELEM_BUFFER_SIZE   10

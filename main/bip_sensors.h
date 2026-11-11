@@ -6,6 +6,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/portmacro.h"
 
 #define MAX_CAL_POINTS 5
 
@@ -71,6 +72,8 @@ public:
     float mapMultiPoint(float x);
 
 private:
+    float mapMultiPoint_unlocked(float x);
+    portMUX_TYPE _mux;
     const char* _name;
     float _currentValue;
     float _rawVolts;

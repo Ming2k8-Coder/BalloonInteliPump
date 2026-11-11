@@ -27,6 +27,8 @@ public:
     
     void setRampRate(float rate);
     uint8_t getCurrentPWM();
+    void setOcDebounceSamples(uint16_t samples);
+    uint16_t getOcDebounceSamples() const;
 
 private:
     gpio_num_t _pin;
@@ -34,7 +36,8 @@ private:
     float _currentPWM_f;
     uint8_t _sagPwmLimit;
     float _idleVoltsSnapshot;
-    uint8_t _ocOverCount;
+    uint16_t _ocOverCount;
+    uint16_t _ocDebounceLimit;
     
     SafetySettings _safety;
     bool _safetyTriggered;
@@ -45,5 +48,6 @@ private:
 extern BIP_Motor pumpMotor;
 esp_err_t init_solenoid_valve();
 void write_solenoid_pwm(uint8_t pwm);
+uint8_t get_solenoid_pwm();
 
 #endif // BIP_MOTOR_H

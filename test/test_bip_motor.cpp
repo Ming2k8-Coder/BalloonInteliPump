@@ -1,7 +1,7 @@
 #include "unity.h"
 #include "bip_motor.h"
 
-static BIP_Motor testMotor(GPIO_NUM_3);
+static BIP_Motor testMotor(PIN_MOTOR_PWM);
 
 void test_motor_soft_start_ramping(void) {
     testMotor.clearSafetyLockout();
@@ -30,15 +30,25 @@ void test_motor_overcurrent_inrush_debounce(void) {
     testMotor.setSafetySettings(s);
     testMotor.setTargetPWM(150);
 
-    // Sample 1: Transient Overcurrent Spike (4.5A > 4.0A) -> Debounce count = 1, NOT tripped yet
-    testMotor.update(4.5f, 12.0f, 12.0f);
-    TEST_ASSERT_FALSE(testMotor.isSafetyTriggered());
+    // Transient inrush test: 20 samples of 4.5A (> 4.0A, 10ms @ 2000 SPS) -> Must NOT trip
+    for (int i = 0; i < 20; i++) {
+        testMotor.update(4.5f, 12.0f, 12.0f);
+        TEST_ASSERT_FALSE(testMotor.isSafetyTriggered());
+    }
 
-    // Sample 2: Overcurrent continues (4.5A) -> Debounce count = 2, NOT tripped yet
-    testMotor.update(4.5f, 12.0f, 12.0f);
-    TEST_ASSERT_FALSE(testMotor.isSafetyTriggered());
+    // Current recovers to normal (2.0A) for 20 samples -> Leaky bucket counter clears
+    for (int i = 0; i < 20; i++) {
+        testMotor.update(2.0f, 12.0f, 12.0f);
+        TEST_ASSERT_FALSE(testMotor.isSafetyTriggered());
+    }
 
-    // Sample 3: Overcurrent continues (4.5A) -> Debounce count = 3 -> TRIPPED!
+    // Sustained overcurrent test: 49 samples of 4.5A -> Still NOT tripped (debounce limit = 50 samples / 25ms)
+    for (int i = 0; i < 49; i++) {
+        testMotor.update(4.5f, 12.0f, 12.0f);
+        TEST_ASSERT_FALSE(testMotor.isSafetyTriggered());
+    }
+
+    // Sample 50: Sustained overcurrent reaches 50 samples (25ms @ 2000 SPS) -> TRIPPED!
     testMotor.update(4.5f, 12.0f, 12.0f);
     TEST_ASSERT_TRUE(testMotor.isSafetyTriggered());
     TEST_ASSERT_EQUAL_STRING("OC_LOCK", testMotor.getSafetyError());

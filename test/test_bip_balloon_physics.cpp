@@ -7,8 +7,8 @@ void test_mooney_rivlin_hyperelastic_stress(void) {
     init_balloon_physics(BALLOON_11INCH);
     
     // Simulate stretch ratio lambda = 2.0
-    // Expected Mooney-Rivlin wall stress at lambda=2.0 (C10=180, C01=20):
-    // sigma = 2 * (4.0 - 0.5) * (180 + 20/2) = 2 * 3.5 * 190 = 1330 kPa
+    // Expected Mooney-Rivlin equibiaxial wall stress at lambda=2.0 (C10=180, C01=20):
+    // sigma = 2 * (4.0 - 0.0625) * (180 + 20 * 4.0) = 2 * 3.9375 * 260 = 2047.5 kPa
     update_balloon_physics_ext(15.0f, 0.0f, 0.0f, 25.0f, 0.001f);
     BalloonMaterialPhysics state = get_balloon_physics_state();
     
@@ -113,7 +113,9 @@ void test_online_mooney_rivlin_identification(void) {
     // Feed 60 synthetic (pressure, stretch_ratio) samples to train online RLS
     for (int i = 0; i < 60; i++) {
         float lambda = 1.2f + (float)i * 0.02f;
-        float p = 2.0f * (lambda * lambda - 1.0f / lambda) * (180.0f + 20.0f / lambda) * 0.01f;
+        float inv_l = 1.0f / lambda;
+        float inv_l7 = 1.0f / std::pow(lambda, 7.0f);
+        float p = 0.04f * (inv_l - inv_l7) * (180.0f + 20.0f * lambda * lambda);
         update_online_material_identification(p, lambda);
     }
 

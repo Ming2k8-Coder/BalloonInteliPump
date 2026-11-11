@@ -1,3 +1,4 @@
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import serial
@@ -11,8 +12,29 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import collections
 
+# PY-CRASH-01: Reconfigure stdout and stderr for UTF-8 with fallback
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # Protocol Constants
 BAUD_RATE = 115200
+
+# PY-SYNC-01: Synchronized Mode Code Definitions (0-10) matching ESP32 bip_state.h
+MODE_NAMES = {
+    0: "IDLE",
+    1: "MANUAL",
+    2: "SMART",
+    3: "BURST",
+    4: "PULSE",
+    5: "PATTERN",
+    6: "CALIBRATION",
+    7: "ERROR",
+    8: "DIAMETER",
+    9: "RIDE",
+    10: "CONDITION",
+}
 
 class SerialManager:
     def __init__(self, port, baud, data_callback):
@@ -104,9 +126,18 @@ class UDPManager:
                 if not self.cmd_queue.empty():
                     cmd = self.cmd_queue.get()
                     if self.device_ip:
-                        self.socket.sendto((cmd + '\n').encode(), (self.device_ip, self.port))
+                        try:
+                            self.socket.sendto((cmd + '\n').encode(), (self.device_ip, self.port))
+                        except Exception as e:
+                            print(f"[WARN] UDP send error to {self.device_ip}: {e}")
                     else:
-                        print(f"UDP Command skipped: Device IP not discovered yet (waiting for telemetry)")
+                        # PY-NET-01: Broadcast CONNECT/command if device IP is not yet discovered
+                        target_ips = ["<broadcast>", "255.255.255.255", "192.168.4.1"]
+                        for tip in target_ips:
+                            try:
+                                self.socket.sendto((cmd + '\n').encode(), (tip, self.port))
+                            except Exception:
+                                pass
                 
                 # Listen for telemetry data
                 try:
@@ -121,7 +152,7 @@ class UDPManager:
                     pass
             except Exception as e:
                 if self.running:
-                    print(f"UDP Thread Error: {e}")
+                    print(f"[WARN] UDP Thread Error: {e}")
                 break
 
 class CalibrationWizard(tk.Toplevel):
@@ -217,6 +248,10 @@ class BalloonApp:
         self.recording = False
         self.log_file = None
         self.csv_writer = None
+        
+        # PY-THRD-01: Thread synchronization locks
+        self.data_lock = threading.Lock()
+        self.log_lock = threading.Lock()
         
         # Telemetry Store
         self.raw_press = 0
@@ -499,14 +534,24 @@ class BalloonApp:
         if not self.recording:
             file_path = filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
             if file_path:
-                self.log_file = open(file_path, 'w', newline='')
-                self.csv_writer = csv.writer(self.log_file)
-                self.csv_writer.writerow(["Time", "Pressure", "PWM", "Volts", "Amps", "Mode", "RawP", "RawV", "RawI", "Slope", "Health"])
-                self.recording = True
-                self.btn_record.config(text="Stop Log")
+                with self.log_lock:
+                    self.log_file = open(file_path, 'w', newline='')
+                    self.csv_writer = csv.writer(self.log_file)
+                    # PY-ML-01: Harmonized standard CSV headers
+                    self.csv_writer.writerow(["Time_Device_s", "Pressure_kPa", "PWM", "Voltage_V", "Current_A", "Mode", "RawP", "RawV", "RawI", "Slope_kPa_s", "Health_Pct"])
+                    self.recording = True
+                    self.btn_record.config(text="Stop Log")
         else:
-            self.recording = False
-            if self.log_file: self.log_file.close()
+            with self.log_lock:
+                self.recording = False
+                if self.log_file:
+                    try:
+                        self.log_file.flush()
+                        self.log_file.close()
+                    except Exception:
+                        pass
+                    self.log_file = None
+                    self.csv_writer = None
             self.btn_record.config(text="Start Log")
 
     def send_cmd(self, cmd):
@@ -536,12 +581,14 @@ class BalloonApp:
         self.send_cmd(cmd)
 
     def clear_plot(self):
-        self.times.clear()
-        self.pressures.clear()
-        self.slopes.clear()
-        self.slope_buffer.clear()
-        self.fatigue_index = 0.0
-        self.last_time = None
+        # PY-THRD-01: Thread-safe buffer clear
+        with self.data_lock:
+            self.times.clear()
+            self.pressures.clear()
+            self.slopes.clear()
+            self.slope_buffer.clear()
+            self.fatigue_index = 0.0
+            self.last_time = None
         self.root.after(0, self.update_plot)
 
     def open_cal_wizard(self):
@@ -584,7 +631,8 @@ class BalloonApp:
                 i = float(parts[5])
                 mode_code = int(parts[6])
                 
-                m_str = {0: "IDLE", 1: "MANUAL", 2: "SMART", 3: "BURST", 4: "CALIB", 5: "ERROR"}.get(mode_code, f"MODE_{mode_code}")
+                # PY-SYNC-01: Synchronized mode code definitions (0-10)
+                m_str = MODE_NAMES.get(mode_code, f"MODE_{mode_code}")
                 
                 if len(parts) >= 10:
                     self.raw_press = float(parts[7])
@@ -595,49 +643,52 @@ class BalloonApp:
                 # Advanced Material Analysis Calculations (The Algorithms)
                 # ----------------------------------------------------
                 
-                if self.last_time is not None and t < self.last_time - 1.0:
-                    self.slope_buffer.clear()
-                    self.fatigue_index = 0.0
+                with self.data_lock:
+                    if self.last_time is not None and t < self.last_time - 1.0:
+                        self.slope_buffer.clear()
+                        self.fatigue_index = 0.0
 
-                # 1. Linear Regression dP/dt Slope (savitzky-golay style)
-                self.slope_buffer.append((t, p))
-                slope = 0.0
-                if len(self.slope_buffer) >= 5:
-                    xs = [pt[0] for pt in self.slope_buffer]
-                    ys = [pt[1] for pt in self.slope_buffer]
-                    n = len(xs)
-                    mean_x = sum(xs) / n
-                    mean_y = sum(ys) / n
-                    num = sum((xs[idx] - mean_x) * (ys[idx] - mean_y) for idx in range(n))
-                    custom_den = sum((xs[idx] - mean_x) ** 2 for idx in range(n))
-                    if custom_den > 1e-6:
-                        slope = num / custom_den
-                
-                # 2. Fatigue Index & Lifetime Decay
-                if self.last_time is not None:
-                    dt = t - self.last_time
-                    stress_ratio = max(0.0, p / self.estimated_burst)
-                    if dt > 0 and dt < 1.0: # Ignore lag/jump hiccups
-                        self.fatigue_index += (stress_ratio ** 3.0) * dt * 10.0
-                self.last_time = t
-                
-                # Remaining Balloon Health Percentage
-                health_pct = max(0.0, 100.0 - self.fatigue_index)
-                
-                # 3. Elastic Reserve Limit
-                reserve_pct = max(0.0, ((self.estimated_burst - p) / self.estimated_burst) * 100.0)
+                    # 1. Linear Regression dP/dt Slope (savitzky-golay style)
+                    self.slope_buffer.append((t, p))
+                    slope = 0.0
+                    if len(self.slope_buffer) >= 5:
+                        xs = [pt[0] for pt in self.slope_buffer]
+                        ys = [pt[1] for pt in self.slope_buffer]
+                        n = len(xs)
+                        mean_x = sum(xs) / n
+                        mean_y = sum(ys) / n
+                        num = sum((xs[idx] - mean_x) * (ys[idx] - mean_y) for idx in range(n))
+                        custom_den = sum((xs[idx] - mean_x) ** 2 for idx in range(n))
+                        if custom_den > 1e-6:
+                            slope = num / custom_den
+                    
+                    # 2. Fatigue Index & Lifetime Decay
+                    if self.last_time is not None:
+                        dt = t - self.last_time
+                        stress_ratio = max(0.0, p / self.estimated_burst)
+                        if dt > 0 and dt < 1.0: # Ignore lag/jump hiccups
+                            self.fatigue_index += (stress_ratio ** 3.0) * dt * 10.0
+                    self.last_time = t
+                    
+                    # Remaining Balloon Health Percentage
+                    health_pct = max(0.0, 100.0 - self.fatigue_index)
+                    
+                    # 3. Elastic Reserve Limit
+                    reserve_pct = max(0.0, ((self.estimated_burst - p) / self.estimated_burst) * 100.0)
 
-                # Store plotting buffers
-                self.times.append(t)
-                self.pressures.append(p)
-                self.slopes.append(slope)
+                    # Store plotting buffers under lock
+                    self.times.append(t)
+                    self.pressures.append(p)
+                    self.slopes.append(slope)
                 
                 # Update GUI variables on main thread safely
                 self.root.after(0, lambda: self._update_gui(p, pwm, v, i, m_str, reserve_pct, health_pct, slope))
                 
-                if self.recording and self.csv_writer:
-                    self.csv_writer.writerow(parts[1:] + [f"{slope:.4f}", f"{health_pct:.2f}"])
-                    self.log_file.flush()
+                # Full Precision CSV logging protected by lock
+                with self.log_lock:
+                    if self.recording and self.csv_writer and self.log_file and not self.log_file.closed:
+                        self.csv_writer.writerow(parts[1:] + [f"{slope:.4f}", f"{health_pct:.2f}"])
+                        self.log_file.flush()
                     
         except Exception as e:
             print(f"Parse error: {e}")
@@ -680,17 +731,23 @@ class BalloonApp:
             self.update_plot()
 
     def update_plot(self):
-        self.line_p.set_data(list(self.times), list(self.pressures))
-        self.line_s.set_data(list(self.times), list(self.slopes))
+        # PY-THRD-01: Take atomic snapshot of deques under lock to avoid RuntimeError: deque mutated during iteration
+        with self.data_lock:
+            t_list = list(self.times)
+            p_list = list(self.pressures)
+            s_list = list(self.slopes)
+            
+        self.line_p.set_data(t_list, p_list)
+        self.line_s.set_data(t_list, s_list)
         
-        if self.times:
-            x_min, x_max = min(self.times), max(self.times)
+        if t_list:
+            x_min, x_max = min(t_list), max(t_list)
             self.ax1.set_xlim(x_min, x_max)
             
-            p_min, p_max = min(self.pressures), max(self.pressures)
+            p_min, p_max = min(p_list), max(p_list)
             self.ax1.set_ylim(min(0.0, p_min - 1), p_max + 2)
             
-            s_min, s_max = min(self.slopes), max(self.slopes)
+            s_min, s_max = min(s_list), max(s_list)
             self.ax2.set_ylim(s_min - 0.2, s_max + 0.2)
             
         self.canvas.draw()

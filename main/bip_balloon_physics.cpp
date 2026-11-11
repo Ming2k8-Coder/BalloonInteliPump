@@ -3,6 +3,8 @@
 #include "bip_state.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include <cmath>
 #include <algorithm>
 
@@ -16,10 +18,15 @@ static float maxSafeStretchLambda = 5.5f;
 static const float BASE_C10 = 180.0f; // kPa
 static const float BASE_C01 = 20.0f;  // kPa
 
+// Material geometry constants
+static const float INITIAL_WALL_THICKNESS_M = 0.00035f; // 0.35 mm uninflated thickness
+
 // Idea #1: Standard Linear Solid (SLS) Viscoelastic Model
 static const float E_r = 80.0f;     // Viscous modulus (kPa)
 static const float TAU_R = 1.2f;    // Relaxation time constant (seconds)
 static float viscous_stress_kpa = 0.0f;
+static float s_prev_lambda = 1.0f;
+static bool s_first_physics_step = true;
 
 // Idea #7: Adaptive Burst Threshold Learning
 static float learned_burst_threshold = -40.0f; // Initial threshold (kPa/s)
@@ -34,40 +41,74 @@ static FatigueState fatigue = {};
 static const float FATIGUE_K = 1.0e8f;
 static const float FATIGUE_M = 3.5f;
 
+// Forward declaration of RLS reset variables
+static float rls_sum_w = 0.0f;
+static float rls_sum_x = 0.0f;
+static float rls_sum_y = 0.0f;
+static float rls_sum_xy = 0.0f;
+static float rls_sum_xx = 0.0f;
+static float rls_sum_yy = 0.0f;
+static int rls_sample_count = 0;
+
 static BalloonMaterialPhysics currentPhysics = {};
+static portMUX_TYPE s_physics_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void init_balloon_physics(BalloonType type) {
     set_balloon_preset(type);
+    portENTER_CRITICAL(&s_physics_mux);
     currentPhysics = {};
     viscous_stress_kpa = 0.0f;
+    s_prev_lambda = 1.0f;
+    s_first_physics_step = true;
+    rls_sum_w = 0.0f;
+    rls_sum_x = 0.0f;
+    rls_sum_y = 0.0f;
+    rls_sum_xy = 0.0f;
+    rls_sum_xx = 0.0f;
+    rls_sum_yy = 0.0f;
+    rls_sample_count = 0;
+    portEXIT_CRITICAL(&s_physics_mux);
     current_impact = IMPACT_NONE;
     positive_spike_peak = 0.0f;
     positive_spike_time = 0;
 }
 
 void reset_fatigue_tracker() {
+    portENTER_CRITICAL(&s_physics_mux);
     fatigue = {};
     fatigue.safe_pressure_remaining_pct = 100.0f;
+    portEXIT_CRITICAL(&s_physics_mux);
     ESP_LOGI(TAG, "Cyclic Fatigue Tracker reset.");
 }
 
 FatigueState get_fatigue_state() {
-    return fatigue;
+    FatigueState out;
+    portENTER_CRITICAL(&s_physics_mux);
+    out = fatigue;
+    portEXIT_CRITICAL(&s_physics_mux);
+    return out;
 }
 
 void record_bounce_cycle(float peak_stress_kpa) {
     if (peak_stress_kpa <= 1.0f) return;
+
+    // ALG-MR-03: Convert stress from kPa to MPa (Basquin curve calibrated in MPa)
+    float peak_stress_mpa = peak_stress_kpa * 0.001f;
+    if (peak_stress_mpa < 0.01f) peak_stress_mpa = 0.01f;
+
+    portENTER_CRITICAL(&s_physics_mux);
     fatigue.total_bounce_count++;
     if (peak_stress_kpa > fatigue.max_bounce_stress_kpa) {
         fatigue.max_bounce_stress_kpa = peak_stress_kpa;
     }
 
-    // Miner's Rule: N_f = K / σ^m
-    float Nf = FATIGUE_K / std::pow(peak_stress_kpa, FATIGUE_M);
+    // Miner's Rule: N_f = K / σ_MPa^m
+    float Nf = FATIGUE_K / std::pow(peak_stress_mpa, FATIGUE_M);
     if (Nf < 1.0f) Nf = 1.0f;
     fatigue.accumulated_damage += (1.0f / Nf);
     fatigue.accumulated_damage = std::clamp(fatigue.accumulated_damage, 0.0f, 1.0f);
     fatigue.safe_pressure_remaining_pct = (1.0f - fatigue.accumulated_damage) * 100.0f;
+    portEXIT_CRITICAL(&s_physics_mux);
 
     if (fatigue.accumulated_damage > 0.70f) {
         ESP_LOGW(TAG, "FATIGUE WARNING: D=%.3f (%lu bounces). Capacity down to %.1f%%",
@@ -144,8 +185,6 @@ void update_balloon_physics(float pressure_kpa, float dp_dt, float dt_sec) {
 
 // Online Mooney-Rivlin Parameter Identification RLS State
 static OnlineMaterialParams onlineParams = { .estimated_C10 = 180.0f, .estimated_C01 = 20.0f, .r_squared = 0.0f, .converged = false };
-static float rls_sum_x = 0.0f, rls_sum_y = 0.0f, rls_sum_xy = 0.0f, rls_sum_xx = 0.0f;
-static int rls_sample_count = 0;
 
 // Micro-Flutter Tear Precursor Detector State
 static float flutter_window[16] = {0};
@@ -154,45 +193,70 @@ static float current_flutter_variance = 0.0f;
 static bool tear_precursor_detected = false;
 
 void update_online_material_identification(float pressure_kpa, float stretch_ratio) {
+    if (!std::isfinite(stretch_ratio) || !std::isfinite(pressure_kpa)) return;
     if (stretch_ratio <= 1.05f || pressure_kpa <= 2.0f) return;
 
-    float lambda = stretch_ratio;
+    float lambda = std::clamp(stretch_ratio, 1.0f, 10.0f);
     float lambda_sq = lambda * lambda;
-    float inv_lambda = 1.0f / lambda;
-    float denom = 2.0f * (lambda_sq - inv_lambda);
+    float inv_lambda4 = 1.0f / (lambda_sq * lambda_sq);
+    float denom = 2.0f * (lambda_sq - inv_lambda4);
     if (denom <= 0.001f) return;
 
-    // Linear regression y = C10 + C01 * x, where y = sigma / denom, x = 1/lambda
-    float y = pressure_kpa / denom;
-    float x = inv_lambda;
+    // Equibiaxial Cauchy stress from pressure: sigma = P * (D0 / 4*t0) * lambda^3
+    float t0_cm = INITIAL_WALL_THICKNESS_M * 100.0f; // 0.035 cm
+    float geom_ratio = initialDiameterCm / (4.0f * t0_cm);
+    float sigma_meas = pressure_kpa * geom_ratio * (lambda_sq * lambda);
+
+    // Linear regression y = C10 + C01 * x, where y = sigma_meas / denom, x = lambda^2
+    float y = sigma_meas / denom;
+    float x = lambda_sq;
 
     // Online Exponential Forgetting Factor (gamma = 0.995)
     const float gamma = 0.995f;
-    rls_sum_x  = gamma * rls_sum_x + x;
-    rls_sum_y  = gamma * rls_sum_y + y;
+    rls_sum_w  = gamma * rls_sum_w  + 1.0f;
+    rls_sum_x  = gamma * rls_sum_x  + x;
+    rls_sum_y  = gamma * rls_sum_y  + y;
     rls_sum_xy = gamma * rls_sum_xy + (x * y);
     rls_sum_xx = gamma * rls_sum_xx + (x * x);
+    rls_sum_yy = gamma * rls_sum_yy + (y * y);
     rls_sample_count++;
 
-    if (rls_sample_count >= 50) {
-        float n = (float)rls_sample_count;
-        float denominator = (n * rls_sum_xx - rls_sum_x * rls_sum_x);
-        if (std::abs(denominator) > 1e-5f) {
-            float slope_C01 = (n * rls_sum_xy - rls_sum_x * rls_sum_y) / denominator;
-            float intercept_C10 = (rls_sum_y - slope_C01 * rls_sum_x) / n;
+    // Guard: Require sufficient history and persistent excitation in stretch ratio
+    if (rls_sample_count >= 50 && rls_sum_w >= 30.0f) {
+        float w = rls_sum_w;
+        float denominator = (w * rls_sum_xx - rls_sum_x * rls_sum_x);
+        float var_x = denominator / (w * w);
+
+        // Persistent excitation guard: stretch variance must be non-zero
+        if (var_x > 0.005f) {
+            float num_xy = (w * rls_sum_xy - rls_sum_x * rls_sum_y);
+            float slope_C01 = num_xy / denominator;
+            float intercept_C10 = (rls_sum_y - slope_C01 * rls_sum_x) / w;
 
             if (intercept_C10 > 50.0f && intercept_C10 < 400.0f && slope_C01 >= 0.0f && slope_C01 < 100.0f) {
+                float denom_y = (w * rls_sum_yy - rls_sum_y * rls_sum_y);
+                float r2 = 0.0f;
+                if (denom_y > 1e-4f) {
+                    r2 = (num_xy * num_xy) / (denominator * denom_y);
+                }
+
+                portENTER_CRITICAL(&s_physics_mux);
                 onlineParams.estimated_C10 = 0.95f * onlineParams.estimated_C10 + 0.05f * intercept_C10;
                 onlineParams.estimated_C01 = 0.95f * onlineParams.estimated_C01 + 0.05f * slope_C01;
                 onlineParams.converged = true;
-                onlineParams.r_squared = std::clamp((rls_sum_xy * rls_sum_xy) / (rls_sum_xx * (rls_sum_y * rls_sum_y / n + 1e-4f)), 0.0f, 1.0f);
+                onlineParams.r_squared = std::clamp(r2, 0.0f, 1.0f);
+                portEXIT_CRITICAL(&s_physics_mux);
             }
         }
     }
 }
 
 OnlineMaterialParams get_online_material_params() {
-    return onlineParams;
+    OnlineMaterialParams out;
+    portENTER_CRITICAL(&s_physics_mux);
+    out = onlineParams;
+    portEXIT_CRITICAL(&s_physics_mux);
+    return out;
 }
 
 bool is_tear_precursor_flutter_detected() {
@@ -206,12 +270,20 @@ float get_flutter_variance() {
 void update_balloon_physics_ext(float pressure_kpa, float dp_dt, float d2p_dt2, float mcu_temp_c, float dt_sec) {
     if (dt_sec <= 0.0f) dt_sec = 0.0005f;
 
+    BalloonMaterialPhysics local_phys = {};
     BalloonPhysicsEstimate volEst = get_balloon_physics_estimate();
 
-    // 1. Calculate Stretch Ratio Lambda = D / D0
-    float lambda = volEst.diameter_cm / initialDiameterCm;
-    if (lambda < 1.0f) lambda = 1.0f;
-    currentPhysics.stretch_ratio = lambda;
+    // 1. Calculate Stretch Ratio Lambda = D / D0 with strict bounds
+    float safe_d0 = (initialDiameterCm >= 1.0f) ? initialDiameterCm : 7.0f;
+    float lambda = volEst.diameter_cm / safe_d0;
+    
+    // Numerical Guard: NaN check and physical stretch boundaries [1.0, 10.0]
+    if (!std::isfinite(lambda) || lambda < 1.0f) {
+        lambda = 1.0f;
+    } else if (lambda > 10.0f) {
+        lambda = 10.0f;
+    }
+    local_phys.stretch_ratio = lambda;
 
     // Idea #8: Thermal Softening Adjustment for Latex
     float ambient_est_c = std::clamp(mcu_temp_c - 15.0f, 15.0f, 55.0f);
@@ -241,53 +313,73 @@ void update_balloon_physics_ext(float pressure_kpa, float dp_dt, float d2p_dt2, 
     current_flutter_variance = var_sum / 16.0f;
     tear_precursor_detected = (pressure_kpa > 15.0f && current_flutter_variance > 120.0f);
 
-    // 2. Mooney-Rivlin 2-Parameter Hyperelastic Stress Model
+    // 2. Mooney-Rivlin Equibiaxial Spherical Membrane Model (ALG-MR-01)
     float lambda_sq = lambda * lambda;
-    float inv_lambda = 1.0f / lambda;
-    float hyper_stress = 2.0f * (lambda_sq - inv_lambda) * (effective_C10 + effective_C01 * inv_lambda);
+    float inv_lambda_sq = 1.0f / lambda_sq;
+    float inv_lambda_4 = inv_lambda_sq * inv_lambda_sq;
+    float hyper_stress = 2.0f * (lambda_sq - inv_lambda_4) * (effective_C10 + effective_C01 * lambda_sq);
+    if (hyper_stress < 0.0f) hyper_stress = 0.0f;
 
-    // Idea #1: SLS Viscoelastic Stress Relaxation ODE Integration
-    static float prev_lambda = 1.0f;
-    float d_lambda_dt = (lambda - prev_lambda) / dt_sec;
-    prev_lambda = lambda;
+    // Idea #1: Unconditionally Stable SLS Viscoelastic Exponential Integrator
+    float d_lambda = 0.0f;
+    if (s_first_physics_step) {
+        s_prev_lambda = lambda;
+        s_first_physics_step = false;
+    } else {
+        d_lambda = lambda - s_prev_lambda;
+        s_prev_lambda = lambda;
+    }
 
-    float d_viscous = (E_r * d_lambda_dt - (viscous_stress_kpa / TAU_R)) * dt_sec;
-    viscous_stress_kpa += d_viscous;
+    float safe_dt = std::clamp(dt_sec, 0.0001f, 1.0f);
+    float alpha = std::exp(-safe_dt / TAU_R);
+    viscous_stress_kpa = (viscous_stress_kpa * alpha) + (E_r * d_lambda);
     if (viscous_stress_kpa < 0.0f) viscous_stress_kpa = 0.0f;
 
-    currentPhysics.viscous_stress_kpa = viscous_stress_kpa;
-    currentPhysics.hyperelastic_stress_kpa = hyper_stress + viscous_stress_kpa;
+    local_phys.viscous_stress_kpa = viscous_stress_kpa;
+    local_phys.hyperelastic_stress_kpa = hyper_stress + viscous_stress_kpa;
 
-    // 3. Strain Energy Density W (Joules)
-    float I1 = lambda_sq + 2.0f * inv_lambda;
-    float I2 = 2.0f * lambda + (1.0f / lambda_sq);
+    // 3. Strain Energy Density W (Joules) & Constant Rubber Volume Integration (ALG-MR-02)
+    float I1 = 2.0f * lambda_sq + inv_lambda_4;
+    float I2 = (lambda_sq * lambda_sq) + 2.0f * inv_lambda_sq;
     float W_density = effective_C10 * (I1 - 3.0f) + effective_C01 * (I2 - 3.0f);
-    currentPhysics.strain_energy_j = W_density * (volEst.volume_liters * 0.001f);
+    if (W_density < 0.0f) W_density = 0.0f;
+
+    float r0_m = (initialDiameterCm * 0.01f) * 0.5f;
+    float v_rubber_m3 = 4.0f * (float)M_PI * r0_m * r0_m * INITIAL_WALL_THICKNESS_M;
+    local_phys.strain_energy_j = (W_density * 1000.0f) * v_rubber_m3;
 
     // Idea #10: Fatigue Derating on Max Safe Stretch
     float fatigue_derating = 1.0f - (fatigue.accumulated_damage * 0.30f);
     float effective_max_lambda = maxSafeStretchLambda * fatigue_derating;
-    currentPhysics.yield_probability = std::clamp(lambda / effective_max_lambda, 0.0f, 1.0f);
+    local_phys.yield_probability = std::clamp(lambda / effective_max_lambda, 0.0f, 1.0f);
 
     // Idea #9: Impact Event Classification & Shock Filter
     current_impact = classify_pressure_event(dp_dt, d2p_dt2, pressure_kpa);
-    currentPhysics.impact_type = current_impact;
+    local_phys.impact_type = current_impact;
 
     if (current_impact == IMPACT_BURST || tear_precursor_detected) {
-        currentPhysics.burst_shock_detected = true;
+        local_phys.burst_shock_detected = true;
         if (tear_precursor_detected) {
             ESP_LOGW(TAG, "MICRO-FLUTTER TEAR PRECURSOR DETECTED! Var: %.1f", current_flutter_variance);
         } else {
             ESP_LOGW(TAG, "BURST SHOCK CONFIRMED! dP/dt = %.2f kPa/s at P = %.2f kPa", dp_dt, pressure_kpa);
         }
     } else {
-        currentPhysics.burst_shock_detected = false;
+        local_phys.burst_shock_detected = false;
     }
+
+    portENTER_CRITICAL(&s_physics_mux);
+    currentPhysics = local_phys;
+    portEXIT_CRITICAL(&s_physics_mux);
 }
 
 
 BalloonMaterialPhysics get_balloon_physics_state() {
-    return currentPhysics;
+    BalloonMaterialPhysics out;
+    portENTER_CRITICAL(&s_physics_mux);
+    out = currentPhysics;
+    portEXIT_CRITICAL(&s_physics_mux);
+    return out;
 }
 
 // Idea #13: Pre-Ride Weight-to-Pressure Optimal Inflation Calculator
@@ -314,8 +406,11 @@ RideInflationAdvice compute_ride_inflation(float rider_kg, BalloonType type, flo
 
     float delta_P_body_kpa = (F_N / (M_PI * r_contact_m * r_contact_m)) / 1000.0f;
 
-    float burst_stress = 2.0f * (maxLambda * maxLambda - 1.0f / maxLambda) * (BASE_C10 + BASE_C01 / maxLambda);
-    float t_wall_mm = 0.35f / working_lambda;
+    float maxLambda_sq = maxLambda * maxLambda;
+    float inv_maxLambda4 = 1.0f / (maxLambda_sq * maxLambda_sq);
+    float burst_stress = 2.0f * (maxLambda_sq - inv_maxLambda4) * (BASE_C10 + BASE_C01 * maxLambda_sq);
+    float working_lambda_sq = working_lambda * working_lambda;
+    float t_wall_mm = 0.35f / working_lambda_sq;
     float p_burst_kpa = 2.0f * (t_wall_mm / 1000.0f) * burst_stress / (D_m / 2.0f);
 
     float safety_factor = 0.65f;
@@ -342,15 +437,19 @@ void update_burst_threshold_from_pop() {
     int total_samples = get_pop_sample_count();
     float min_dpdt = 0.0f;
 
+    PopBlackBoxSample prev = get_pop_sample(0);
+
     for (int i = 1; i < total_samples; i++) {
-        PopBlackBoxSample s1 = get_pop_sample(i - 1);
-        PopBlackBoxSample s2 = get_pop_sample(i);
-        uint32_t dt_us = s2.timestamp_us - s1.timestamp_us;
-        if (dt_us > 0) {
-            float dt_sec = (float)dt_us / 1000000.0f;
-            float dpdt = (s2.pressure - s1.pressure) / dt_sec;
-            if (dpdt < min_dpdt) min_dpdt = dpdt;
+        PopBlackBoxSample curr = get_pop_sample(i);
+        // FW-PERF-01: Only compute derivative for negative pressure drops
+        if (curr.pressure < prev.pressure) {
+            uint32_t dt_us = curr.timestamp_us - prev.timestamp_us;
+            if (dt_us > 0) {
+                float dpdt = (curr.pressure - prev.pressure) * 1000000.0f / (float)dt_us;
+                if (dpdt < min_dpdt) min_dpdt = dpdt;
+            }
         }
+        prev = curr;
     }
 
     if (min_dpdt < -20.0f) {

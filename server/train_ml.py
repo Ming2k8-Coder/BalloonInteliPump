@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import pandas as pd
 import numpy as np
@@ -6,6 +7,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
 import joblib
+
+# PY-CRASH-01: Reconfigure stdout and stderr for UTF-8 with fallback
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Target log directory
 LOG_DIR = "logs"
@@ -15,15 +22,25 @@ def load_dataset():
     """Loads all CSV log files in logs/ and aggregates them for training."""
     csv_files = glob.glob(os.path.join(LOG_DIR, "*.csv"))
     if not csv_files:
-        print(f"❌ No training logs found in '{LOG_DIR}/'. Please run some test sessions first!")
+        print(f"[FAIL] No training logs found in '{LOG_DIR}/'. Please run some test sessions first!")
         return None, None
         
-    print(f"📂 Found {len(csv_files)} test log files. Parsing datasets...")
+    print(f"[INFO] Found {len(csv_files)} test log files. Parsing datasets...")
     
     dfs = []
     for file in csv_files:
         try:
             df = pd.read_csv(file)
+            # PY-ML-01: Harmonize column headers from both GUI and Server CSV loggers
+            col_map = {
+                "Pressure": "Pressure_kPa",
+                "Volts": "Voltage_V",
+                "Amps": "Current_A",
+                "Slope": "Slope_kPa_s",
+                "Health": "Health_Pct",
+                "Time": "Time_Device_s",
+            }
+            df = df.rename(columns=col_map)
             # Ensure required columns exist
             required_cols = ["Pressure_kPa", "Slope_kPa_s", "Voltage_V", "Current_A", "Mode", "Health_Pct", "PWM"]
             if all(col in df.columns for col in required_cols):
@@ -31,7 +48,7 @@ def load_dataset():
                 df = compute_advanced_features(df)
                 dfs.append(df)
         except Exception as e:
-            print(f"⚠️ Error parsing {file}: {e}")
+            print(f"[WARN] Error parsing {file}: {e}")
             
     if not dfs:
         return None, None
@@ -46,8 +63,8 @@ def compute_advanced_features(df):
     Computes rolling DSP and material physics features on the dataset
     to empower our Random Forest classifier.
     """
-    # 1. Pressure variance (rolling 30 samples = 300ms window at 100Hz)
-    df["Pressure_Var_300ms"] = df["Pressure_kPa"].rolling(window=30, min_periods=1).var().fillna(0.0)
+    # 1. Pressure variance (rolling 30 samples = 300ms window at 100Hz, ddof=0 to match app.py)
+    df["Pressure_Var_300ms"] = df["Pressure_kPa"].rolling(window=30, min_periods=1).var(ddof=0).fillna(0.0)
     
     # 2. Cumulative Squeeze Work (Integral of pressure over a rolling 50 samples = 500ms window)
     df["Pressure_Integral_500ms"] = df["Pressure_kPa"].rolling(window=50, min_periods=1).sum().fillna(0.0) * 0.01  # dt = 10ms
@@ -71,21 +88,28 @@ def label_data(df):
     2: YIELDING (Entering plastic deformation zone)
     3: DANGER (Impending burst / structural failure)
     """
-    print("🏷️ Labeling dataset based on material physics rules...")
+    print("[INFO] Labeling dataset based on material physics rules...")
     
     labels = []
     for idx, row in df.iterrows():
-        p = row["Pressure_kPa"]
-        slope = row["Slope_kPa_s"]
-        health = row["Health_Pct"]
-        mode = row["Mode"]
+        p = float(row["Pressure_kPa"])
+        slope = float(row["Slope_kPa_s"])
+        health = float(row["Health_Pct"])
+        mode_val = row["Mode"]
+        
+        # Handle both integer mode codes and mode names
+        if isinstance(mode_val, (int, np.integer)) or (isinstance(mode_val, str) and mode_val.strip().isdigit()):
+            m_code = int(mode_val)
+            mode_str = {0: "IDLE", 1: "MANUAL", 2: "SMART", 3: "BURST", 4: "PULSE", 5: "PATTERN", 6: "CALIBRATION", 7: "ERROR", 8: "DIAMETER", 9: "RIDE", 10: "CONDITION"}.get(m_code, f"MODE_{m_code}")
+        else:
+            mode_str = str(mode_val).strip().upper()
         
         # Physics-based heuristics for training labels
         if health <= 20.0 or p >= 45.0:
             labels.append(3) # DANGER (Pop imminent)
-        elif mode == "SMART" and slope <= 0.15 and p > 15.0:
+        elif mode_str in ("SMART", "MODE_2") and slope <= 0.15 and p > 15.0:
             labels.append(2) # YIELDING (Latex entering plastic expansion)
-        elif slope > 1.5 and mode == "MANUAL":
+        elif slope > 1.5 and mode_str in ("MANUAL", "MODE_1"):
             labels.append(1) # SQUEEZE (Transient play spike)
         else:
             labels.append(0) # STABLE
@@ -111,8 +135,8 @@ def train_model():
     # Split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    print(f"⚡ Training Random Forest Classifier on {len(X_train)} samples...")
-    print(f"💻 Utilizing Intel i3-10105F CPU core execution...")
+    print(f"[INFO] Training Random Forest Classifier on {len(X_train)} samples...")
+    print(f"[INFO] Utilizing CPU core execution...")
     
     # Random Forest is highly optimized for CPU multicore execution
     model = RandomForestClassifier(n_estimators=100, max_depth=12, n_jobs=-1, random_state=42)
@@ -120,17 +144,17 @@ def train_model():
     
     # Evaluation
     y_pred = model.predict(X_test)
-    print("\n📊 Model Performance Report:")
-    print(classification_report(y_test, y_pred, target_names=["STABLE", "SQUEEZE", "YIELDING", "DANGER"]))
+    print("\n[INFO] Model Performance Report:")
+    print(classification_report(y_test, y_pred, labels=[0, 1, 2, 3], target_names=["STABLE", "SQUEEZE", "YIELDING", "DANGER"], zero_division=0))
     
     # Save the trained model
     joblib.dump(model, MODEL_PATH)
-    print(f"💾 Model successfully exported to: {MODEL_PATH}")
+    print(f"[OK] Model successfully exported to: {MODEL_PATH}")
     
     # Optional: Feature Importance Analysis
     importances = model.feature_importances_
     for name, importance in zip(features, importances):
-        print(f"🔍 Feature '{name}': Importance {importance*100:.2f}%")
+        print(f"[INFO] Feature '{name}': Importance {importance*100:.2f}%")
 
 if __name__ == "__main__":
     train_model()

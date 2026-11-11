@@ -3,6 +3,8 @@
 #include "bip_volume_estimator.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/portmacro.h"
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -10,9 +12,26 @@
 static const char *TAG = "BIP_STATE";
 
 EventGroupHandle_t sysEventGroup = NULL;
-SystemMode currentMode = MODE_IDLE;
+std::atomic<SystemMode> currentMode{MODE_IDLE};
+
+// SMP Spinlocks for cross-core state and buffer synchronization
+static portMUX_TYPE s_state_buf_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_bounce_mux = portMUX_INITIALIZER_UNLOCKED;
 static const char* errorLine1 = "";
 static const char* errorLine2 = "";
+
+// FW-SAFE-02: Configurable Global Overpressure Ceiling
+static float s_maxSystemPressure = MAX_SYSTEM_PRESSURE_KPA;
+
+float get_max_system_pressure() {
+    return s_maxSystemPressure;
+}
+
+void set_max_system_pressure(float ceiling_kpa) {
+    if (ceiling_kpa >= 5.0f && ceiling_kpa <= 80.0f) {
+        s_maxSystemPressure = ceiling_kpa;
+    }
+}
 
 // Smart Mode Variables
 enum SmartPhase {
@@ -105,9 +124,11 @@ static float current_d2p_dt2 = 0.0f;
 static float rls_weights[3] = { 0.8f, 0.15f, 0.05f };
 static float last_forecasted = 0.0f;
 
-// DUAL-RAM SYSTEM: LIVE CONTINUOUS RING BUFFER + FAST MEMCPY SAFE POP RAM
-static PopBlackBoxSample liveRingBuffer[POP_BUF_SIZE];
-static PopBlackBoxSample safePopRAMBuffer[POP_BUF_SIZE];
+// FW-PERF-01: Dual static buffers for O(1) zero-copy ping-pong pointer swapping
+static PopBlackBoxSample popBufferA[POP_BUF_SIZE];
+static PopBlackBoxSample popBufferB[POP_BUF_SIZE];
+static PopBlackBoxSample *liveRingBuffer = popBufferA;
+static PopBlackBoxSample *safePopRAMBuffer = popBufferB;
 
 static int liveWriteIndex = 0;
 static int safePopHeadIndex = 0;
@@ -117,6 +138,7 @@ static float burstPeak = 0.0f;
 static bool burstPopped = false;
 
 static void reset_buffers() {
+    portENTER_CRITICAL(&s_state_buf_mux);
     memset(pressureBuf, 0, sizeof(pressureBuf));
     memset(timeBuf, 0, sizeof(timeBuf));
     bufIndex = 0;
@@ -129,6 +151,7 @@ static void reset_buffers() {
     pid_lastTime = 0;
     rideStartTimeUs = 0;
     rideBaselinePressure = 0.0f;
+    portEXIT_CRITICAL(&s_state_buf_mux);
 }
 
 void set_pulse_params(float base_pressure, float amplitude, float frequency_hz) {
@@ -161,7 +184,11 @@ void set_ride_params(float rider_weight_kg, float sink_depth_cm) {
 }
 
 BounceRhythmState get_bounce_rhythm() {
-    return bounceRhythm;
+    BounceRhythmState out;
+    portENTER_CRITICAL(&s_bounce_mux);
+    out = bounceRhythm;
+    portEXIT_CRITICAL(&s_bounce_mux);
+    return out;
 }
 
 void start_balloon_conditioning(int cycles) {
@@ -196,7 +223,8 @@ void post_mode_change(SystemMode newMode) {
                              BIP_EVENT_MODE_SMART | BIP_EVENT_MODE_BURST |
                              BIP_EVENT_MODE_PULSE | BIP_EVENT_MODE_PATTERN |
                              BIP_EVENT_MODE_ERROR | BIP_EVENT_MODE_RIDE |
-                             BIP_EVENT_MODE_DIAMETER);
+                             BIP_EVENT_MODE_DIAMETER | BIP_EVENT_MODE_CONDITION |
+                             BIP_EVENT_SMART_FINISHED);
     }
 
     reset_buffers();
@@ -204,35 +232,44 @@ void post_mode_change(SystemMode newMode) {
     switch (newMode) {
         case MODE_IDLE:
             pumpMotor.setTargetPWM(0);
-            write_solenoid_pwm(0);
+            // FW-SAFE-04: Do not force valve closed in IDLE so emergency STOP venting is preserved
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_IDLE);
             break;
         case MODE_MANUAL:
+            write_solenoid_pwm(0); // Seal vent when starting inflation
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_MANUAL);
             break;
         case MODE_SMART:
+            write_solenoid_pwm(0);
             smartState = SMART_IDLE;
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_SMART);
             break;
         case MODE_BURST:
+            write_solenoid_pwm(0);
             burstPopped = false;
             burstPeak = 0.0f;
             safePopDataReady = false;
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_BURST);
             break;
         case MODE_PULSE:
+            write_solenoid_pwm(0);
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_PULSE);
             break;
         case MODE_PATTERN:
+            write_solenoid_pwm(0);
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_PATTERN);
             break;
         case MODE_DIAMETER:
+            write_solenoid_pwm(0);
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_DIAMETER);
             break;
         case MODE_RIDE:
+            write_solenoid_pwm(0);
             if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_RIDE);
             break;
         case MODE_CONDITION:
+            write_solenoid_pwm(0);
+            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_MODE_CONDITION);
             break;
         case MODE_CALIBRATION:
             pumpMotor.setTargetPWM(0);
@@ -257,12 +294,16 @@ void record_pop_sample(float p, float rawV, uint8_t pwm, float currentA) {
     if (postPopHoldCountdown > 0) {
         postPopHoldCountdown--;
         if (postPopHoldCountdown == 0) {
-            memcpy(safePopRAMBuffer, liveRingBuffer, sizeof(liveRingBuffer));
+            // FW-PERF-01: Zero-copy pointer swap replaces 64KB memcpy (8ns vs 250us)
+            PopBlackBoxSample *tmp = safePopRAMBuffer;
+            safePopRAMBuffer = liveRingBuffer;
+            liveRingBuffer = tmp;
             safePopHeadIndex = liveWriteIndex;
             safePopDataReady = true;
-            if (sysEventGroup != NULL) xEventGroupSetBits(sysEventGroup, BIP_EVENT_POP_TRIGGERED);
-            ESP_LOGI(TAG, "POP CAPTURED! Executed fast memcpy into Safe RAM.");
-            update_burst_threshold_from_pop();
+            // Signal Core 0 background task to process burst threshold asynchronously
+            if (sysEventGroup != NULL) {
+                xEventGroupSetBits(sysEventGroup, BIP_EVENT_POP_TRIGGERED);
+            }
         }
     }
 }
@@ -297,8 +338,12 @@ void dump_pop_recording() {
 }
 
 static void add_sample(float p) {
-    pressureBuf[bufIndex] = p;
-    timeBuf[bufIndex] = esp_timer_get_time();
+    if (!std::isfinite(p)) return;
+
+    portENTER_CRITICAL(&s_state_buf_mux);
+    int curr_idx = bufIndex;
+    pressureBuf[curr_idx] = p;
+    timeBuf[curr_idx] = esp_timer_get_time();
     bufIndex = (bufIndex + 1) % SG_WINDOW_SIZE;
     if (bufIndex == 0) bufFull = true;
 
@@ -312,7 +357,7 @@ static void add_sample(float p) {
         int64_t dt_micro = timeBuf[(bufIndex + SG_WINDOW_SIZE - 1) % SG_WINDOW_SIZE] - timeBuf[oldest_idx];
         float dt_sec = (float)dt_micro / 1000000.0f;
         float h = dt_sec / (float)(SG_WINDOW_SIZE - 1);
-        if (h <= 0.0001f) h = 0.0005f;
+        if (!std::isfinite(h) || h < 0.0002f || h > 0.02f) h = 0.0005f;
 
         for (int i = 0; i < SG_WINDOW_SIZE; i++) {
             int idx = (oldest_idx + i) % SG_WINDOW_SIZE;
@@ -322,15 +367,46 @@ static void add_sample(float p) {
 
         current_dp_dt = num_dp / (60.0f * h);
         current_d2p_dt2 = num_d2p / (462.0f * h * h);
+    } else {
+        // ALG-FSM-01: 2-point finite-difference fallback for partially filled buffers (N in [2, 8])
+        if (curr_idx >= 1) {
+            int prev_idx = curr_idx - 1;
+            int64_t dt_micro = timeBuf[curr_idx] - timeBuf[prev_idx];
+            if (dt_micro > 100 && dt_micro < 1000000) {
+                float dt_sec = (float)dt_micro / 1000000.0f;
+                current_dp_dt = (pressureBuf[curr_idx] - pressureBuf[prev_idx]) / dt_sec;
+            } else {
+                current_dp_dt = 0.0f;
+            }
+        } else {
+            current_dp_dt = 0.0f;
+        }
+        current_d2p_dt2 = 0.0f;
     }
+    portEXIT_CRITICAL(&s_state_buf_mux);
 }
 
-float get_local_dp_dt() { return current_dp_dt; }
-float get_local_d2p_dt2() { return current_d2p_dt2; }
+float get_local_dp_dt() {
+    portENTER_CRITICAL(&s_state_buf_mux);
+    float val = current_dp_dt;
+    portEXIT_CRITICAL(&s_state_buf_mux);
+    return val;
+}
+
+float get_local_d2p_dt2() {
+    portENTER_CRITICAL(&s_state_buf_mux);
+    float val = current_d2p_dt2;
+    portEXIT_CRITICAL(&s_state_buf_mux);
+    return val;
+}
 
 float predict_local_pressure_forecast(int steps_ahead) {
-    if (!bufFull) return pressureSensor.getValue();
     float p_curr = pressureSensor.getValue();
+    portENTER_CRITICAL(&s_state_buf_mux);
+    if (!bufFull) {
+        portEXIT_CRITICAL(&s_state_buf_mux);
+        return p_curr;
+    }
     int idx1 = (bufIndex + SG_WINDOW_SIZE - 1) % SG_WINDOW_SIZE;
     int idx2 = (bufIndex + SG_WINDOW_SIZE - 2) % SG_WINDOW_SIZE;
     int idx3 = (bufIndex + SG_WINDOW_SIZE - 3) % SG_WINDOW_SIZE;
@@ -340,6 +416,7 @@ float predict_local_pressure_forecast(int steps_ahead) {
     float pred = rls_weights[0] * x0 + rls_weights[1] * x1 + rls_weights[2] * x2;
     if (!std::isfinite(pred) || pred < 0.0f) pred = p_curr;
     last_forecasted = pred;
+    portEXIT_CRITICAL(&s_state_buf_mux);
     return pred;
 }
 
@@ -428,6 +505,7 @@ static void update_diameter() {
 
     if (phys.yield_probability > 0.88f) {
         pumpMotor.emergencyStop();
+        write_solenoid_pwm(0);
         trigger_error("DIAMETER", "Rupture risk > 88%");
         return;
     }
@@ -441,15 +519,40 @@ static void update_diameter() {
     if (dt <= 0.001f) dt = 0.001f;
     pid_lastTime = now;
 
-    if (std::abs(error) < 5.0f) pid_integral += error * dt;
-    else pid_integral = 0.0f;
-    pid_integral = std::clamp(pid_integral, -20.0f, 20.0f);
+    // ALG-VOL-02: Control law with deadband and actuator mutual exclusion (remove feedforward)
+    const float DIAMETER_DEADBAND_CM = 0.5f;
 
-    float output = (pid_Kp * 1.5f * error) + (pid_Ki * pid_integral) + (pid_Kff * 1.2f * targetDiameterCm);
-    pumpMotor.setTargetPWM(std::clamp((int)output, 0, 255));
+    if (error > DIAMETER_DEADBAND_CM) {
+        // Undersized: Inflate with PID control
+        write_solenoid_pwm(0); // Ensure vent is sealed
+        
+        if (error < 5.0f) {
+            pid_integral += error * dt;
+        } else {
+            pid_integral = 0.0f;
+        }
+        pid_integral = std::clamp(pid_integral, -20.0f, 20.0f);
 
-    if (error < -1.0f) write_solenoid_pwm(140);
-    else write_solenoid_pwm(0);
+        float output = (pid_Kp * 1.5f * error) + (pid_Ki * pid_integral);
+        int targetPWM = std::clamp((int)output, 40, 255); // Respect minimum motor torque
+        pumpMotor.setTargetPWM(targetPWM);
+
+    } else if (error < -DIAMETER_DEADBAND_CM) {
+        // Oversized: Halt pump and vent excess pressure
+        pumpMotor.setTargetPWM(0);
+        pid_integral = 0.0f;
+
+        // Proportional pulse venting
+        float overshoot = -error; // Positive cm overshoot
+        int ventPWM = std::clamp((int)(100.0f + overshoot * 20.0f), 120, 255);
+        write_solenoid_pwm((uint8_t)ventPWM);
+
+    } else {
+        // Within Deadband (Target Reached): Hold steady
+        pumpMotor.setTargetPWM(0);
+        write_solenoid_pwm(0);
+        pid_integral = 0.0f;
+    }
 }
 
 // Idea #12: Bounce Rhythm Detector Algorithm
@@ -464,7 +567,9 @@ static void update_bounce_rhythm_detector(float dp_dt, float pressure_kpa) {
                 else bouncePeriodEmaMs = 0.70f * bouncePeriodEmaMs + 0.30f * measured_period_ms;
 
                 consecutiveBouncePeriods++;
+                portENTER_CRITICAL(&s_bounce_mux);
                 bounceRhythm.bounce_count++;
+                portEXIT_CRITICAL(&s_bounce_mux);
                 record_bounce_cycle(get_balloon_physics_state().hyperelastic_stress_kpa);
             }
         }
@@ -472,6 +577,7 @@ static void update_bounce_rhythm_detector(float dp_dt, float pressure_kpa) {
     }
     prevDpDtForPeak = dp_dt;
 
+    portENTER_CRITICAL(&s_bounce_mux);
     bounceRhythm.rhythm_locked = (consecutiveBouncePeriods >= 4 && bouncePeriodEmaMs > 200.0f);
     if (bounceRhythm.rhythm_locked) {
         bounceRhythm.period_ms = bouncePeriodEmaMs;
@@ -479,6 +585,7 @@ static void update_bounce_rhythm_detector(float dp_dt, float pressure_kpa) {
         float elapsed_in_cycle = (float)(now - lastBouncePeakTimeUs) / 1000.0f;
         bounceRhythm.phase_angle = fmodf(elapsed_in_cycle / bouncePeriodEmaMs, 1.0f);
     }
+    portEXIT_CRITICAL(&s_bounce_mux);
 }
 
 // Idea #11: Ride Mode Active Weight-Bearing Pressure Controller
@@ -685,7 +792,6 @@ static void update_pattern() {
 
 static void update_smart() {
     float p = pressureSensor.getValue();
-    add_sample(p);
 
     switch (smartState) {
         case SMART_IDLE:
@@ -715,19 +821,24 @@ static void update_smart() {
                 if (p >= target) {
                     pumpMotor.setTargetPWM(0);
                     smartState = SMART_FINISHED;
+                    if (sysEventGroup != NULL) {
+                        xEventGroupSetBits(sysEventGroup, BIP_EVENT_SMART_FINISHED);
+                    }
+                    ESP_LOGI(TAG, "SMART INFLATION FINISHED: Target %.2f kPa reached. Returning to IDLE.", target);
+                    post_mode_change(MODE_IDLE);
                 }
             }
             break;
             
         case SMART_FINISHED:
             pumpMotor.setTargetPWM(0);
+            post_mode_change(MODE_IDLE);
             break;
     }
 }
 
 static void update_burst() {
     float p = pressureSensor.getValue();
-    add_sample(p);
 
     if (burstPopped) {
         if (pumpMotor.getCurrentPWM() > 0) pumpMotor.emergencyStop();
@@ -738,15 +849,32 @@ static void update_burst() {
     
     pumpMotor.setTargetPWM(255);
     
-    if (burstPeak > 10.0f && p < burstPeak * 0.8f && postPopHoldCountdown == 0 && !safePopDataReady) {
+    // FW-SAFE-03: Incorporate burst_shock_detected for immediate pop detection in burst mode
+    BalloonMaterialPhysics phys = get_balloon_physics_state();
+    if ((phys.burst_shock_detected || (burstPeak > 10.0f && p < burstPeak * 0.8f)) && !burstPopped) {
         pumpMotor.emergencyStop();
         burstPopped = true;
-        postPopHoldCountdown = 1000;
-        ESP_LOGI(TAG, "POP DETECTED! Peak: %.2f kPa. Recording 1000 post-pop samples before safe memcpy...", burstPeak);
+        if (postPopHoldCountdown == 0 && !safePopDataReady) {
+            postPopHoldCountdown = 1000;
+            ESP_LOGI(TAG, "POP DETECTED! Peak: %.2f kPa. Initiating 1000 post-pop sample capture...", burstPeak);
+        }
     }
 }
 
 void update_state_machine() {
+    // ALG-FSM-01: Centralized sample update ensures valid dP/dt and d2P/dt2 across all active modes
+    float currentPressure = pressureSensor.getValue();
+    add_sample(currentPressure);
+
+    // FW-SAFE-03: Guard all operational modes against burst shock / tear precursor
+    BalloonMaterialPhysics phys = get_balloon_physics_state();
+    if (phys.burst_shock_detected && currentMode != MODE_ERROR && currentMode != MODE_BURST) {
+        pumpMotor.emergencyStop();
+        write_solenoid_pwm(255);
+        trigger_error("BURST SAFETY", "BURST SHOCK DETECTED");
+        return;
+    }
+
     switch (currentMode) {
         case MODE_IDLE:
             pumpMotor.setTargetPWM(0);
@@ -779,6 +907,7 @@ void update_state_machine() {
             break;
         case MODE_ERROR:
             pumpMotor.emergencyStop();
+            write_solenoid_pwm(255); // Maintain continuous pressure dump in error state
             break;
     }
 }
